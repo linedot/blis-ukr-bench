@@ -78,7 +78,7 @@ find_library(BLIS_LIBRARY
     REQUIRED
 )
 
-target_include_directories(blis_ukr_bench PRIVATE ${BLIS_INCLUDE_DIR} ${EXTRA_INCLUDES})
+target_include_directories(blis_ukr_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/archcomp/include ${BLIS_INCLUDE_DIR} ${EXTRA_INCLUDES})
 target_link_libraries(blis_ukr_bench PRIVATE ${BLIS_LIBRARY} ${EXTRA_LIBS})
 
 if(EXTRA_CFLAGS)
