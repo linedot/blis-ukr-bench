@@ -1,0 +1,6 @@
+[submodule "performance_counters"]
+	path = performance_counters
+	url = https://github.com/linedot/performance_counters
+[submodule "archcomp"]
+	path = archcomp
+	url = https://github.com/linedot/archcomp
