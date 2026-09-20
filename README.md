@@ -93,3 +93,7 @@ Size[Byte],[GFLOP/s],FLOPS,cycles/iter,l1d_read_miss/iter
 536872448,102.70118005944595,12884911104,638290113,8389951
 ```
 
+Analysis script
+---------------
+
+See [ANALYSIS.md](ANALYSIS.md)
