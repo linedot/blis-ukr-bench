@@ -567,17 +567,59 @@ def intercepts(bench: Bench, fits: list[Fit]) -> list[str]:
             continue
         prev = fits[i - 2]
         if f.intercept < 0 and f.slope > prev.slope:
+            # The residency reading only holds if every point in the region implies
+            # the SAME resident amount.  Check it rather than assert it: a region
+            # whose per-k cost is still changing, or one measured across a clock
+            # change, produces a negative intercept that means nothing of the kind.
+            kk, yy = bench.k[f.lo:f.hi], bench.y[f.lo:f.hi]
+            per_pt = (f.slope * kk - yy) / (f.slope - prev.slope)
+            good = per_pt > 0
+            spread = per_pt[good].max() / per_pt[good].min() if good.any() else float("inf")
             k_res = -f.intercept / (f.slope - prev.slope)
             byt = (bench.mr + bench.nr) * DOUBLE * k_res + bench.mr * bench.nr * DOUBLE
             out.append(f"    region {i}: C = {f.intercept:.0f} +/- {f.se_c:.0f} {unit} is not a "
                        f"per-call cost -- it is the region starting out partly served at region "
                        f"{i-1}'s {prev.slope:.3f} {unit}/k")
-            out.append(f"               -> k_res = {k_res:.0f} ({human_bytes(byt)} of A+B) still "
-                       f"resident; compare against the last-level cache")
+            if good.all() and spread <= 2.0:
+                agg = (f" (x{bench.threads} threads = {human_bytes(byt * bench.threads)} "
+                       f"against the shared cache)" if bench.threads > 1 else "")
+                out.append(f"               -> k_res = {k_res:.0f} ({human_bytes(byt)} of A+B "
+                           f"per thread) still resident{agg}; compare against the last-level "
+                           f"cache. Consistent to {spread:.2f}x across the region's points")
+            else:
+                why = ""
+                if "ghz" in bench.cols:
+                    g = bench.cols["ghz"][f.lo:f.hi]
+                    if g.max() / g.min() > 1.03:
+                        why = (f" The clock moves {g.min():.2f}-{g.max():.2f} GHz inside this "
+                               f"region, so a fit in cycles mixes rates; try --y ns.")
+                out.append(f"               -> reads as {human_bytes(byt)} per thread resident, "
+                           f"but the points imply {per_pt[good].min()/1000:.0f}k.."
+                           f"{per_pt[good].max()/1000:.0f}k ({spread:.1f}x apart), so that is "
+                           f"not a fixed resident amount -- C is absorbing curvature, the per-k "
+                           f"cost is still changing through the region.{why}")
         else:
             out.append(f"    region {i}: C = {f.intercept:.1f} +/- {f.se_c:.1f} {unit}, an "
                        f"extrapolation from k >= {bench.k[f.lo]:.0f} back to 0, not a per-call cost")
     return out
+
+
+def peak_rate(bench: Bench, f: Fit, peak: float | None) -> float | None:
+    """--peak, expressed in the units this region's rate column uses.
+
+    It is given as FLOP/cycle.  Fitting in cycles needs no conversion; fitting in
+    ns needs a clock, and the right one is the best this region actually reached
+    -- peak means what the hardware could have done, and it demonstrably ran that
+    fast somewhere in the region.  Using the region's median instead reports a
+    compute-bound region at over 100% of peak whenever the clock drops inside it.
+    """
+    if peak is None:
+        return None
+    if bench.unit == "cycles":
+        return peak
+    ghz = (float(bench.cols["ghz"][f.lo:f.hi].max()) if "ghz" in bench.cols
+           else bench.freq_ghz)
+    return peak * ghz if ghz else None
 
 
 def region_ghz(bench: Bench, f: Fit) -> float | None:
@@ -634,14 +676,21 @@ def report(bench: Bench, fits: list[Fit], scan, caches, show_scan: bool,
                 f"at {human_bytes(bench.cols['size'][lo_i])} ({100*(1-g.min()/g.max()):.1f}% lower). "
                 f"b is in cycles and cannot see this -- compare GFLOP/s, not FLOP/cycle, "
                 f"when deciding where to block")
+    if peak and bench.unit == "ns" and peak_rate(bench, fits[0], peak) is None:
+        notes.append("--peak is in FLOP/cycle and this fit is in ns, but no clock is known "
+                     "for the conversion; pass --ghz for a %peak column")
     if peak:
-        over = [i for i, f in enumerate(fits, 1) if bench.flops_per_k / f.slope > peak]
+        over = [i for i, f in enumerate(fits, 1)
+                if (pk := peak_rate(bench, f, peak)) and bench.flops_per_k / f.slope > pk]
         for i in over:
             f = fits[i - 1]
-            floor = bench.flops_per_k / peak
+            pk = peak_rate(bench, f, peak)
+            floor = bench.flops_per_k / pk
             notes.append(
                 f"region {i}: b = {f.slope:.3f} is below the {floor:.3f} {per_k} floor implied by "
-                f"--peak {peak:g} -- not physically reachable, so that window does not pin down b "
+                f"--peak {peak:g}"
+                + (f" at {pk / peak:.3f} GHz" if bench.unit == "ns" else "")
+                + " -- not physically reachable, so that window does not pin down b "
                 f"(se {f.se:.3f}); it is usually the small-k end, where b*k barely moves t(k)")
     for note in notes:
         print(f"  note: {note}")
@@ -651,9 +700,10 @@ def report(bench: Bench, fits: list[Fit], scan, caches, show_scan: bool,
             f"{'b [' + per_k + ']':>14} {'+/-':>7} {'C [' + unit + ']':>11} {'R^2':>8} "
             f"{'maxdev':>8} {rate:>11} {bw:>9}")
     has_ghz = "ghz" in bench.cols
+    show_peak = bool(peak) and peak_rate(bench, fits[0], peak) is not None
     if has_ghz:
         head += f" {'GHz':>6}"
-    if peak:
+    if show_peak:
         head += f" {'%peak':>7}"
     if has_l1d:
         head += f" {'miss/k':>7}"
@@ -670,8 +720,8 @@ def report(bench: Bench, fits: list[Fit], scan, caches, show_scan: bool,
                f"{bench.flops_per_k / f.slope:>11.2f} {bench.bytes_per_k / f.slope:>9.2f}")
         if has_ghz:
             row += f" {region_ghz(bench, f):>6.3f}"
-        if peak:
-            row += f" {bench.flops_per_k / f.slope / peak * 100:>6.1f}%"
+        if show_peak:
+            row += (f" {bench.flops_per_k / f.slope / peak_rate(bench, f, peak) * 100:>6.1f}%")
         if has_l1d:
             miss = fit_extra(bench.cols["l1d"], bench.k, f)
             row += f" {miss:>7.2f}" if np.isfinite(miss) else f"{'-':>8}"
@@ -681,7 +731,8 @@ def report(bench: Bench, fits: list[Fit], scan, caches, show_scan: bool,
     for line in intercepts(bench, fits):
         print(line)
     base = next((f for f in fits
-                 if not peak or bench.flops_per_k / f.slope <= peak), fits[0])
+                 if (pk := peak_rate(bench, f, peak)) is None
+                 or bench.flops_per_k / f.slope <= pk), fits[0])
     for line in amortisation(bench, base, caches, usable):
         print(line)
     for i, f in enumerate(fits, 1):
@@ -796,8 +847,15 @@ def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | No
         # the fixed cost, on a scale where it is actually visible: what share of
         # each call it is.  C only means "per-call overhead" for the region that
         # reaches small k, so use that one.
-        f = next((x for x in fits if not peak or b.flops_per_k / x.slope <= peak), fits[0])
-        if f.intercept > 0 and f.slope > 0:
+        f = next((x for x in fits
+                  if x.intercept > 0 and x.slope > 0
+                  and ((pk := peak_rate(b, x, peak)) is None
+                       or b.flops_per_k / x.slope <= pk)),
+                 next((x for x in fits if x.intercept > 0 and x.slope > 0), None))
+        if f is None:
+            print(f"note: {b.name}: no region has a positive C, so the overhead panel is "
+                  f"empty for it", file=sys.stderr)
+        else:
             kk = np.logspace(np.log10(b.k[f.lo]), np.log10(b.k[f.hi - 1]), 200)
             ax4.plot(kk, 100 * f.intercept / (f.intercept + f.slope * kk), color=base, lw=2,
                      label=f"{b.title}: C = {f.intercept:.1f} {b.unit}")
@@ -834,9 +892,26 @@ def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | No
     ax1.legend(fontsize=7.5, loc="upper left")
 
     if peak:
-        floor = benches[0].flops_per_k / peak
-        ax2.axhline(floor, color="k", ls="--", lw=1.6,
-                    label=f"Peak ({floor:.4g} {unit}/k)")
+        # In cycles the floor is a constant.  In ns it is flops_per_k/(peak*GHz),
+        # so it moves with the clock and gets the same two references panel 3 uses:
+        # a flat line at the best clock seen, and a curve at the measured one.
+        b0 = benches[0]
+        if b0.unit == "cycles":
+            floor = b0.flops_per_k / peak
+            ax2.axhline(floor, color="k", ls="--", lw=1.6,
+                        label=f"Peak ({floor:.4g} {unit}/k)")
+        else:
+            best = max((b.cols["ghz"].max() for b in benches if "ghz" in b.cols),
+                       default=ghz)
+            if best:
+                ax2.axhline(b0.flops_per_k / (peak * best), color="k", ls="--", lw=1.6,
+                            label=f"Peak ({b0.flops_per_k / (peak * best):.3g} {unit}/k "
+                                  f"at {best:.2f} GHz)")
+            for b in benches:
+                if "ghz" not in b.cols or b.cols["ghz"].max() / b.cols["ghz"].min() < 1.01:
+                    continue
+                ax2.plot(b.k, b.flops_per_k / (peak * b.cols["ghz"]), color=".35", lw=1.3,
+                         ls=(0, (4, 2)), zorder=1, label="Peak at measured clock")
     ax2.set(xscale="log", yscale="log" if log_slope else "linear", xlabel="k",
             ylabel=f"local slope d t/d k [{unit}/k]",
             title="local slope -- plateaus are the detected regions")
