@@ -237,7 +237,9 @@ def load(path: str, args) -> Bench:
         raise SystemExit(f"{path}: need either 'cycles/iter' or '[GFLOP/s]'")
 
     if have_cycles and ns is not None:
-        freq = float(np.median(cols["cycles"] / ns))  # cycles/ns = GHz
+        cols["ns"] = ns
+        cols["ghz"] = cols["cycles"] / ns          # per point, not just a median
+        freq = float(np.median(cols["ghz"]))
 
     source = "measured cycles" if unit == "cycles" else "derived from GFLOP/s"
     if args.ghz:
@@ -554,6 +556,19 @@ def intercepts(bench: Bench, fits: list[Fit]) -> list[str]:
     return out
 
 
+def region_ghz(bench: Bench, f: Fit) -> float | None:
+    """The clock this region actually ran at.
+
+    A single median over the whole sweep is not good enough once the machine
+    changes frequency with the working set: b is in cycles and is blind to that,
+    so converting it to GB/s or GFLOP/s with the wrong clock quietly misstates
+    the region that matters.
+    """
+    if "ghz" not in bench.cols:
+        return None
+    return float(np.median(bench.cols["ghz"][f.lo:f.hi]))
+
+
 def report(bench: Bench, fits: list[Fit], scan, caches, show_scan: bool,
            notes: list[str], peak: float | None = None, usable: float = 1.0,
            unroll: int | None = None) -> None:
@@ -585,6 +600,16 @@ def report(bench: Bench, fits: list[Fit], scan, caches, show_scan: bool,
 
     if unroll:
         notes.append(unroll_note(bench.k, unroll))
+    if "ghz" in bench.cols:
+        g = bench.cols["ghz"]
+        if g.max() / g.min() > 1.03:
+            lo_i = int(np.argmin(g))
+            notes.append(
+                f"the clock is not constant: {g.max():.3f} GHz at "
+                f"{human_bytes(bench.cols['size'][int(np.argmax(g))])} down to {g.min():.3f} GHz "
+                f"at {human_bytes(bench.cols['size'][lo_i])} ({100*(1-g.min()/g.max()):.1f}% lower). "
+                f"b is in cycles and cannot see this -- compare GFLOP/s, not FLOP/cycle, "
+                f"when deciding where to block")
     if peak:
         over = [i for i, f in enumerate(fits, 1) if bench.flops_per_k / f.slope > peak]
         for i in over:
@@ -601,6 +626,9 @@ def report(bench: Bench, fits: list[Fit], scan, caches, show_scan: bool,
     head = (f"  {'seg':<7} {'pts':>4} {'k range':>16} {'working set':>20} "
             f"{'b [' + per_k + ']':>14} {'+/-':>7} {'C [' + unit + ']':>11} {'R^2':>8} "
             f"{'maxdev':>8} {rate:>11} {bw:>9}")
+    has_ghz = "ghz" in bench.cols
+    if has_ghz:
+        head += f" {'GHz':>6}"
     if peak:
         head += f" {'%peak':>7}"
     if has_l1d:
@@ -616,6 +644,8 @@ def report(bench: Bench, fits: list[Fit], scan, caches, show_scan: bool,
                f"{f.slope:>14.3f} {f.se:>7.3f} {f.intercept:>11.1f} {f.r2:>8.5f} "
                f"{f.max_dev * 100:>7.2f}% "
                f"{bench.flops_per_k / f.slope:>11.2f} {bench.bytes_per_k / f.slope:>9.2f}")
+        if has_ghz:
+            row += f" {region_ghz(bench, f):>6.3f}"
         if peak:
             row += f" {bench.flops_per_k / f.slope / peak * 100:>6.1f}%"
         if has_l1d:
@@ -632,8 +662,12 @@ def report(bench: Bench, fits: list[Fit], scan, caches, show_scan: bool,
         print(line)
     for i, f in enumerate(fits, 1):
         gbs = ""
-        if unit == "cycles" and bench.freq_ghz:
-            gbs = f", {bench.bytes_per_k / f.slope * bench.freq_ghz:.1f} GB/s @ {bench.freq_ghz:.2f} GHz"
+        fghz = region_ghz(bench, f) or bench.freq_ghz
+        if unit == "cycles" and fghz:
+            per = bench.bytes_per_k / f.slope * fghz
+            gbs = (f", {per:.1f} GB/s" if bench.threads == 1 else
+                   f", {per:.1f} GB/s/thread (x{bench.threads} = {per * bench.threads:.0f} GB/s)")
+            gbs += f" @ {fghz:.3f} GHz"
         print(f"  {i}: t(k) = {f.intercept:.2f} + {f.slope:.4f}*k {unit}"
               f"   ->  {bench.flops_per_k / f.slope:.1f} {rate}, "
               f"{bench.bytes_per_k / f.slope:.2f} {bw}{gbs}")
@@ -649,11 +683,11 @@ CACHE_STYLES = [(0, (1, 2.5)), (0, (6, 3)), (0, (8, 2, 1, 2)), (0, (3, 1, 1, 1, 
 # one linestyle per region, so the fits stay separable in grayscale too
 REGION_STYLES = ["--", "-.", ":", (0, (5, 1, 1, 1, 1, 1))]
 BAND_FILL = ["none", "0.895"]
- 
- 
+
+
 def region_bands(benches: list[Bench], all_fits: list[list[Fit]], key: str):
     """Band edges between regions, in k or in working-set bytes.
- 
+
     Each boundary is put at the geometric mean of the last point of one region
     and the first of the next.  With several files the edges are averaged the
     same way; `spread` says how far the files disagree, so a caller can tell
@@ -669,8 +703,8 @@ def region_bands(benches: list[Bench], all_fits: list[list[Fit]], key: str):
         edges.append(math.exp(sum(math.log(v) for v in vals) / len(vals)))
         spread = max(spread, max(vals) / min(vals))
     return edges, spread, nreg
- 
- 
+
+
 def draw_bands(ax, edges, labels, lo, hi, annotate=False):
     bounds = [lo] + list(edges) + [hi]
     for i, (a, b) in enumerate(zip(bounds, bounds[1:])):
@@ -679,8 +713,8 @@ def draw_bands(ax, edges, labels, lo, hi, annotate=False):
         if annotate and i < len(labels):
             ax.text(math.sqrt(a * b), 0.985, labels[i], transform=ax.get_xaxis_transform(),
                     ha="center", va="top", fontsize=9, color=".35")
- 
- 
+
+
 def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | None,
          show: bool, peak: float | None = None) -> None:
     try:
@@ -693,11 +727,11 @@ def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | No
     except ImportError:
         print("matplotlib or seaborn not available -- skipping plot", file=sys.stderr)
         return
- 
+
     fig, (ax1, ax2, ax3, ax4) = plt.subplots(
         4, 1, figsize=(7, 11.5), gridspec_kw=dict(height_ratios=[1, 1, 1, 0.85]))
     base_colors = sns.color_palette("tab10", max(len(benches), 3))
- 
+
     # regions get the background, files get the hue -- one channel each
     k_edges, k_spread, nreg = region_bands(benches, all_fits, "k")
     s_edges, _, _ = region_bands(benches, all_fits, "size")
@@ -712,10 +746,10 @@ def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | No
     if k_spread > 1.5:
         print(f"note: the files' region boundaries differ by up to {k_spread:.1f}x; "
               f"the shaded bands are their average", file=sys.stderr)
- 
+
     for idx, (b, fits) in enumerate(zip(benches, all_fits)):
         base = base_colors[idx]
- 
+
         ax1.plot(b.k, b.y, "o", color=base, ms=5, zorder=5, label=b.title)
         for j, f in enumerate(fits):
             kk = np.linspace(b.k[f.lo], b.k[f.hi - 1], 64)
@@ -723,18 +757,18 @@ def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | No
                      ls=REGION_STYLES[j % len(REGION_STYLES)],
                      label=f"    {labels[j] if j < len(labels) else j+1}: "
                            f"b={f.slope:.4g} {b.unit}/k")
- 
+
         mid = np.sqrt(b.k[:-1] * b.k[1:])
         ax2.plot(mid, np.diff(b.y) / np.diff(b.k), "o-", color=base, ms=4, lw=1,
                  alpha=0.75, label=b.title)
         for j, f in enumerate(fits):
             ax2.hlines(f.slope, b.k[f.lo], b.k[f.hi - 1], color=base, lw=2.2,
                        ls=REGION_STYLES[j % len(REGION_STYLES)])
- 
+
         if "gflops" in b.cols:
             ax3.plot(b.cols["size"], b.cols["gflops"], "o-", color=base, ms=4, lw=1.4,
                      label=b.title)
- 
+
         # the fixed cost, on a scale where it is actually visible: what share of
         # each call it is.  C only means "per-call overhead" for the region that
         # reaches small k, so use that one.
@@ -750,14 +784,14 @@ def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | No
             # difference of large numbers and measures slope drift, not overhead
             ok = (share > 0) & (model > 1.0)
             ax4.plot(kk_d[ok], share[ok], "o", color=base, ms=5, alpha=0.85)
- 
+
     unit = benches[0].unit
     ghz = next((b.freq_ghz for b in benches if b.freq_ghz), None)
- 
+
     ax1.set(xscale="log", yscale="log", xlabel="k (inner loop iterations)",
             ylabel=f"time per ukr call [{unit}]", title="t(k) = C + b*k, fitted per region")
     ax1.legend(fontsize=7.5, loc="upper left")
- 
+
     if peak:
         floor = benches[0].flops_per_k / peak
         ax2.axhline(floor, color="k", ls="--", lw=1.6,
@@ -765,17 +799,34 @@ def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | No
     ax2.set(xscale="log", xlabel="k", ylabel=f"local slope d t/d k [{unit}/k]",
             title="local slope -- plateaus are the detected regions")
     ax2.legend(fontsize=8)
- 
+
     for i, cap in enumerate(sorted(caches or [])):
         ax3.axvline(cap, color=".35", lw=1.4, ls=CACHE_STYLES[i % len(CACHE_STYLES)],
                     label=f"L{i+1} Cache ({human_bytes(cap)})")
-    if peak and ghz:
-        ax3.axhline(peak * ghz, color="k", ls="--", lw=1.6,
-                    label=f"Peak (at {ghz:.2f} GHz)")
+    if peak:
+        # two references: the best clock the run ever reached, and the clock each
+        # point actually ran at.  data-to-curve is per-cycle efficiency; curve-to-
+        # line is what the machine gave away in frequency.
+        if len({b.threads for b in benches}) > 1:
+            print("note: the files use different thread counts; the peak line uses "
+                  f"{benches[0].threads}", file=sys.stderr)
+        nt = benches[0].threads
+        best = max((b.cols["ghz"].max() for b in benches if "ghz" in b.cols),
+                   default=ghz)
+        if best:
+            ax3.axhline(peak * best * nt, color="k", ls="--", lw=1.6,
+                        label=f"Peak ({nt} thread{'s' if nt > 1 else ''} at {best:.2f} GHz)")
+        for idx, b in enumerate(benches):
+            if "ghz" not in b.cols or b.cols["ghz"].max() / b.cols["ghz"].min() < 1.01:
+                continue
+            g = b.cols["ghz"]
+            ax3.plot(b.cols["size"], peak * g * b.threads, color=".35", lw=1.3,
+                     ls=(0, (4, 2)), zorder=1,
+                     label=f"Peak at measured clock ({g.max():.2f} -> {g.min():.2f} GHz)")
     ax3.set(xscale="log", xlabel="working set A+B+C [byte]", ylabel="GFLOP/s",
             title="throughput vs working set")
     ax3.legend(fontsize=8, ncol=2, loc="best")
- 
+
     for guide in (50, 25, 10, 5, 1):
         ax4.axhline(guide, color=".45", ls=(0, (1, 3)), lw=1)
         ax4.text(0.997, guide, f"{guide}% ", transform=ax4.get_yaxis_transform(),
@@ -784,14 +835,13 @@ def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | No
             ylabel="C / t(k)  [%]",
             title="per-call overhead -- share of t(k) that is the fixed cost C")
     ax4.legend(fontsize=8, loc="lower left")
- 
+
     fig.tight_layout()
     if path:
         fig.savefig(path, dpi=130)
         print(f"wrote {path}")
     if show:
         plt.show()
-
 
 
 # --------------------------------------------------------------------------
