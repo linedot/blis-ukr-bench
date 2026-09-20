@@ -544,7 +544,19 @@ def unroll_note(k: np.ndarray, unroll: int) -> str:
             f"extra fixed cost the others do not, which shows up as scatter in maxdev, not in b")
 
 
-def intercepts(bench: Bench, fits: list[Fit]) -> list[str]:
+def total_capacity(caches, threads: int) -> float | None:
+    """Largest cache level's capacity summed over the whole machine.
+
+    A private level scales with the thread count; a level shared by N threads is
+    instantiated once per group of N.  This is the ceiling any claim of "still
+    resident" has to fit under.
+    """
+    if not caches:
+        return None
+    return max(cap * math.ceil(threads / max(1, min(sh, threads))) for cap, sh in caches)
+
+
+def intercepts(bench: Bench, fits: list[Fit], caches=None) -> list[str]:
     """Say what each region's C actually is.
 
     C is the fitted line at k=0, so it is a per-call overhead only for a region
@@ -580,19 +592,33 @@ def intercepts(bench: Bench, fits: list[Fit]) -> list[str]:
             out.append(f"    region {i}: C = {f.intercept:.0f} +/- {f.se_c:.0f} {unit} is not a "
                        f"per-call cost -- it is the region starting out partly served at region "
                        f"{i-1}'s {prev.slope:.3f} {unit}/k")
-            if good.all() and spread <= 2.0:
-                agg = (f" (x{bench.threads} threads = {human_bytes(byt * bench.threads)} "
-                       f"against the shared cache)" if bench.threads > 1 else "")
+            cap = total_capacity(caches, bench.threads)
+            fits_cache = cap is None or byt * bench.threads <= cap * 1.1
+            if good.all() and spread <= 2.0 and fits_cache:
+                agg = (f" (x{bench.threads} threads = {human_bytes(byt * bench.threads)}"
+                       + (f" against {human_bytes(cap)} of cache)" if cap else
+                          " against the shared cache)") if bench.threads > 1 else "")
                 out.append(f"               -> k_res = {k_res:.0f} ({human_bytes(byt)} of A+B "
-                           f"per thread) still resident{agg}; compare against the last-level "
-                           f"cache. Consistent to {spread:.2f}x across the region's points")
+                           f"per thread) still resident{agg}; consistent to {spread:.2f}x "
+                           f"across the region's points")
+            elif good.all() and spread <= 2.0:
+                lo_r = (bench.y[f.lo + 1] - bench.y[f.lo]) / (bench.k[f.lo + 1] - bench.k[f.lo])
+                hi_r = (bench.y[f.hi - 1] - bench.y[f.hi - 2]) / (bench.k[f.hi - 1] - bench.k[f.hi - 2])
+                out.append(f"               -> reads as {human_bytes(byt)} per thread "
+                           f"(x{bench.threads} = {human_bytes(byt * bench.threads)}), which will "
+                           f"not fit the {human_bytes(cap)} of cache on this machine, so it is "
+                           f"not residency: C is absorbing curvature. The region's own rate is "
+                           f"still moving, {lo_r:.1f} -> {hi_r:.1f} {unit}/k across it")
             else:
                 why = ""
-                if "ghz" in bench.cols:
-                    g = bench.cols["ghz"][f.lo:f.hi]
-                    if g.max() / g.min() > 1.03:
-                        why = (f" The clock moves {g.min():.2f}-{g.max():.2f} GHz inside this "
-                               f"region, so a fit in cycles mixes rates; try --y ns.")
+                g = bench.cols["ghz"][f.lo:f.hi] if "ghz" in bench.cols else None
+                if bench.unit == "cycles" and g is not None and g.max() / g.min() > 1.03:
+                    why = (f" The clock moves {g.min():.2f}-{g.max():.2f} GHz inside this "
+                           f"region, so a fit in cycles mixes rates; try --y ns.")
+                elif f.max_dev > 0.05:
+                    why = (f" This region's own fit is poor ({f.max_dev*100:.1f}% worst "
+                           f"deviation), so it spans more than one regime -- tighten --tol "
+                           f"to split it and the pieces may each be readable.")
                 out.append(f"               -> reads as {human_bytes(byt)} per thread resident, "
                            f"but the points imply {per_pt[good].min()/1000:.0f}k.."
                            f"{per_pt[good].max()/1000:.0f}k ({spread:.1f}x apart), so that is "
@@ -670,12 +696,15 @@ def report(bench: Bench, fits: list[Fit], scan, caches, show_scan: bool,
         g = bench.cols["ghz"]
         if g.max() / g.min() > 1.03:
             lo_i = int(np.argmin(g))
+            blind = ("b is in cycles and cannot see this -- compare GFLOP/s, not FLOP/cycle, "
+                     "when deciding where to block, or refit with --y ns"
+                     if bench.unit == "cycles" else
+                     "b is in ns so it already carries this; the FLOP/cycle view would hide it")
             notes.append(
                 f"the clock is not constant: {g.max():.3f} GHz at "
                 f"{human_bytes(bench.cols['size'][int(np.argmax(g))])} down to {g.min():.3f} GHz "
                 f"at {human_bytes(bench.cols['size'][lo_i])} ({100*(1-g.min()/g.max()):.1f}% lower). "
-                f"b is in cycles and cannot see this -- compare GFLOP/s, not FLOP/cycle, "
-                f"when deciding where to block")
+                + blind)
     if peak and bench.unit == "ns" and peak_rate(bench, fits[0], peak) is None:
         notes.append("--peak is in FLOP/cycle and this fit is in ns, but no clock is known "
                      "for the conversion; pass --ghz for a %peak column")
@@ -728,7 +757,7 @@ def report(bench: Bench, fits: list[Fit], scan, caches, show_scan: bool,
         print(row)
     print("-" * len(head))
     print("  intercepts:")
-    for line in intercepts(bench, fits):
+    for line in intercepts(bench, fits, caches):
         print(line)
     base = next((f for f in fits
                  if (pk := peak_rate(bench, f, peak)) is None
