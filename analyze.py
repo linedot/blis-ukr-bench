@@ -164,6 +164,25 @@ def read_table(path: str) -> tuple[dict[str, str], dict[str, np.ndarray]]:
     return meta, cols
 
 
+def parse_cache_spec(text: str) -> list[tuple[float, int]]:
+    """'48K,1M,32M:8' -> [(49152,1), (1048576,1), (33554432,8)].
+
+    The ':N' suffix says the level is shared by N threads.  A private L1 and L2
+    are per core, but an L3 shared by a whole CCD gives each thread only its
+    slice, so with one thread the capacity is the whole cache and with sixteen
+    it is an eighth of it -- the same spec string is right for both runs.
+    """
+    out = []
+    for item in text.split(","):
+        cap, _, sh = item.partition(":")
+        out.append((parse_size(cap), int(sh) if sh.strip() else 1))
+    return sorted(out)
+
+
+def effective_cap(cap: float, sharers: int, threads: int) -> float:
+    return cap / max(1, min(threads, sharers))
+
+
 def parse_size(text: str) -> float:
     """'512K', '1.5M', '32768' -> bytes."""
     m = re.fullmatch(r"\s*([0-9.]+)\s*([kKmMgG]?)[iI]?[bB]?\s*", text)
@@ -449,15 +468,18 @@ def label_segments(bench: Bench, fits: list[Fit], caches: list[float] | None) ->
     if not caches:
         return [""] * len(fits)
     names = ["L1", "L2", "L3", "L4"]
+
+    def level_of(size):
+        for i, (cap, sh) in enumerate(sorted(caches)):
+            if size <= effective_cap(cap, sh, bench.threads):
+                return names[i] if i < len(names) else f"L{i + 1}"
+        return "DRAM"
+
     out = []
     for f in fits:
-        top = bench.cols["size"][f.hi - 1]
-        level = "DRAM"
-        for i, cap in enumerate(caches):
-            if top <= cap:
-                level = names[i] if i < len(names) else f"L{i + 1}"
-                break
-        out.append(level)
+        lo = level_of(bench.cols["size"][f.lo])
+        hi = level_of(bench.cols["size"][f.hi - 1])
+        out.append(hi if lo == hi else f"{lo}-{hi}")
     return out
 
 
@@ -474,13 +496,15 @@ def cache_limits(bench: Bench, caches: list[float], usable: float) -> list[str]:
     """
     names = ["L1", "L2", "L3", "L4"]
     out = []
-    for i, cap in enumerate(sorted(caches)):
+    for i, (cap, sh) in enumerate(sorted(caches)):
         level = names[i] if i < len(names) else f"L{i + 1}"
-        avail = usable * cap
+        eff = effective_cap(cap, sh, bench.threads)
+        avail = usable * eff
+        shared = f" /{min(sh, bench.threads)} thr = {human_bytes(eff)}" if eff != cap else ""
         k_all = (avail - bench.mr * bench.nr * DOUBLE) / ((bench.mr + bench.nr) * DOUBLE)
         k_b = avail / (bench.nr * DOUBLE)
         all_txt = f"k <= {math.floor(k_all):.0f}" if k_all >= 1 else "does not fit"
-        out.append(f"    {level} {human_bytes(cap):>9}:  A+B+C resident for {all_txt:<14} "
+        out.append(f"    {level} {human_bytes(cap):>9}{shared}:  A+B+C resident for {all_txt:<14} "
                    f"|  B panel alone for k <= {math.floor(k_b):.0f}")
     return out
 
@@ -498,8 +522,8 @@ def amortisation(bench: Bench, f: Fit, caches, usable: float) -> list[str]:
     out = [f"  overhead amortisation (region 1: C = {f.intercept:.1f}, b = {f.slope:.3f}):",
            "    C is " + ",  ".join(f"{frac * 100:.0f}% of t(k) at k = {k:.0f}"
                                     for frac, k in ks.items())]
-    for i, cap in enumerate(sorted(caches or [])[:1]):
-        avail = usable * cap
+    for cap, sh in sorted(caches or [])[:1]:
+        avail = usable * effective_cap(cap, sh, bench.threads)
         klim = (avail - bench.mr * bench.nr * DOUBLE) / ((bench.mr + bench.nr) * DOUBLE)
         if klim >= 1:
             klim = math.floor(klim)
@@ -716,7 +740,7 @@ def draw_bands(ax, edges, labels, lo, hi, annotate=False):
 
 
 def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | None,
-         show: bool, peak: float | None = None) -> None:
+         show: bool, peak: float | None = None, slope_scale: str = "auto") -> None:
     try:
         import matplotlib
         if not show:
@@ -788,6 +812,23 @@ def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | No
     unit = benches[0].unit
     ghz = next((b.freq_ghz for b in benches if b.freq_ghz), None)
 
+    # A DRAM region can be 25x the in-cache slope, which flattens every cache
+    # plateau against the axis floor.  Decide from the spread rather than fixing
+    # one scale: log only helps when the regions are far apart, and only works
+    # when every local slope is positive.
+    sl = np.concatenate([np.diff(b.y) / np.diff(b.k) for b in benches]
+                        + [np.array([f.slope for f in fits]) for fits in all_fits])
+    positive = bool((sl > 0).all())
+    spread = sl.max() / sl.min() if positive else float("inf")
+    if slope_scale == "auto":
+        log_slope = positive and spread > 5
+        if not positive and sl.max() / sl[sl > 0].min() > 5:
+            print("note: slope panel kept linear -- some local slopes are <= 0 "
+                  "(non-monotonic t(k)); --slope-scale log would drop them",
+                  file=sys.stderr)
+    else:
+        log_slope = slope_scale == "log"
+
     ax1.set(xscale="log", yscale="log", xlabel="k (inner loop iterations)",
             ylabel=f"time per ukr call [{unit}]", title="t(k) = C + b*k, fitted per region")
     ax1.legend(fontsize=7.5, loc="upper left")
@@ -796,13 +837,17 @@ def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | No
         floor = benches[0].flops_per_k / peak
         ax2.axhline(floor, color="k", ls="--", lw=1.6,
                     label=f"Peak ({floor:.4g} {unit}/k)")
-    ax2.set(xscale="log", xlabel="k", ylabel=f"local slope d t/d k [{unit}/k]",
+    ax2.set(xscale="log", yscale="log" if log_slope else "linear", xlabel="k",
+            ylabel=f"local slope d t/d k [{unit}/k]",
             title="local slope -- plateaus are the detected regions")
     ax2.legend(fontsize=8)
 
-    for i, cap in enumerate(sorted(caches or [])):
-        ax3.axvline(cap, color=".35", lw=1.4, ls=CACHE_STYLES[i % len(CACHE_STYLES)],
-                    label=f"L{i+1} Cache ({human_bytes(cap)})")
+    nt0 = benches[0].threads
+    for i, (cap, sh) in enumerate(sorted(caches or [])):
+        eff = effective_cap(cap, sh, nt0)
+        tag = f" /{min(sh, nt0)} thr" if eff != cap else ""
+        ax3.axvline(eff, color=".35", lw=1.4, ls=CACHE_STYLES[i % len(CACHE_STYLES)],
+                    label=f"L{i+1} Cache ({human_bytes(cap)}{tag})")
     if peak:
         # two references: the best clock the run ever reached, and the clock each
         # point actually ran at.  data-to-curve is per-cycle efficiency; curve-to-
@@ -873,8 +918,10 @@ def main(argv=None) -> int:
     p.add_argument("--max-segments", type=int, default=6, help="upper bound on the number of regions")
     p.add_argument("--segments", type=int, help="force exactly this many regions")
     p.add_argument("--breaks", help="force boundaries at these working-set sizes, e.g. 512K,8M")
-    p.add_argument("--caches", help="cache capacities for labelling, e.g. 32K,512K,32M; "
-                                    "also prints the largest k that fits each level")
+    p.add_argument("--caches",
+                   help="cache capacities for labelling, e.g. 48K,1M,32M:8; also prints the "
+                        "largest k that fits each level. ':N' marks a level shared by N "
+                        "threads, so a multithreaded run gets its per-thread slice")
     p.add_argument("--unroll", type=int, metavar="N",
                    help="k-unroll factor of the microkernel; checks whether the sweep always "
                         "lands on the same residue mod N (then the tail cost hides in C)")
@@ -885,11 +932,14 @@ def main(argv=None) -> int:
     p.add_argument("--max-size", type=parse_size, help="ignore points above this working-set size")
     p.add_argument("--plot", nargs="?", const="", metavar="FILE",
                    help="draw the fits; with a filename, save instead of showing")
+    p.add_argument("--slope-scale", choices=("auto", "linear", "log"), default="auto",
+                   help="y scale of the local-slope panel; auto goes log when the regions "
+                        "differ by more than 5x (default: auto)")
     p.add_argument("--no-scan", action="store_true", help="hide the segment-count scan")
     args = p.parse_args(argv)
 
     tol = args.tol / 100.0
-    caches = [parse_size(c) for c in args.caches.split(",")] if args.caches else None
+    caches = parse_cache_spec(args.caches) if args.caches else None
     breaks = [parse_size(b) for b in args.breaks.split(",")] if args.breaks else None
 
     benches, all_fits = [], []
@@ -926,7 +976,8 @@ def main(argv=None) -> int:
         all_fits.append(fits)
 
     if args.plot is not None:
-        plot(benches, all_fits, caches, args.plot or None, show=not args.plot, peak=args.peak)
+        plot(benches, all_fits, caches, args.plot or None, show=not args.plot,
+             peak=args.peak, slope_scale=args.slope_scale)
     return 0
 
 
