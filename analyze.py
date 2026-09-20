@@ -776,7 +776,7 @@ def plot(benches: list[Bench], all_fits: list[list[Fit]], caches, path: str | No
             title="throughput vs working set")
     ax3.legend(fontsize=8, ncol=2, loc="best")
  
-    for guide in (10, 5, 1):
+    for guide in (50, 25, 10, 5, 1):
         ax4.axhline(guide, color=".45", ls=(0, (1, 3)), lw=1)
         ax4.text(0.997, guide, f"{guide}% ", transform=ax4.get_yaxis_transform(),
                  ha="right", va="bottom", fontsize=7.5, color=".45")
