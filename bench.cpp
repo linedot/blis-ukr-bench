@@ -26,15 +26,21 @@ extern "C" {
 	"v24","v25","v26","v27","v28","v29","v30","v31"
 
 #if ( BLIS_SME_SM_AT != 0 ) && ( BLIS_SME_ZA_AT != 0 )
+  #pragma message("SMSTART/STOP completely hoisted")
   #define BENCH_SME_ENTER() __asm__ volatile ( "smstart"    ::: BLIS_SME_CLOBBERS )
   #define BENCH_SME_EXIT()  __asm__ volatile ( "smstop"     ::: BLIS_SME_CLOBBERS )
 #elif BLIS_SME_SM_AT != 0
+  #pragma message("SMSTART/STOP partially (sm) hoisted")
   #define BENCH_SME_ENTER() __asm__ volatile ( "smstart sm" ::: BLIS_SME_CLOBBERS )
   #define BENCH_SME_EXIT()  __asm__ volatile ( "smstop sm"  ::: BLIS_SME_CLOBBERS )
 #elif BLIS_SME_ZA_AT != 0
+  #pragma message("SMSTART/STOP partially (za) hoisted")
   #define BENCH_SME_ENTER() __asm__ volatile ( "smstart za" ::: BLIS_SME_CLOBBERS )
   #define BENCH_SME_EXIT()  __asm__ volatile ( "smstop za"  ::: BLIS_SME_CLOBBERS )
 #else
+  #if defined(__ARM_FEATURE_SME)
+    #pragma message("SMSTART/STOP fully inside microkernel")
+  #endif
   #define BENCH_SME_ENTER() do {} while ( 0 )
   #define BENCH_SME_EXIT()  do {} while ( 0 )
 #endif
