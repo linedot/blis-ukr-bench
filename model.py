@@ -20,9 +20,14 @@ ir and jr rows it is the mean realised block, dim / trips.  Micro-tiles are
 still counted continuously (m/m_r): padding to multiples of m_r and n_r is
 not modelled.
 
-Traffic crossing a boundary is the core-side traffic divided by the reuse
-actually realised by the levels inside it.  Reads and writes are tracked
-separately end to end.
+Traffic crossing a boundary is worked out per operand.  A rung's reuse applies
+only to the operand it keeps invariant: each operand's core-side traffic is
+divided by the product of the reuse factors of its own rungs held strictly
+inside the boundary.  A rung's streamers get nothing from it -- they are the
+bytes that stream past the invariant -- and only rungs of their own reduce
+them.  So once jr:A is held in L2, A's traffic beyond L2 is divided by
+n_c/n_r, and B's and C's are untouched.  Packing traffic is not divided by
+reuse; see PACKING.  Reads and writes are tracked separately end to end.
 
 Three things can limit a run, and all three are evaluated:
 
@@ -525,8 +530,8 @@ class boundary:
     inside it -- or to the core, for the innermost level.
 
     :param level: the level doing the supplying
-    :param rd: micro-kernel read bytes per operand, after the reuse realised
-               by the levels inside this boundary
+    :param rd: micro-kernel read bytes per operand, each divided by the reuse
+               of that operand's own rungs held inside this boundary
     :param wr: micro-kernel write bytes per operand, likewise
     :param pack_rd: packing read bytes crossing this boundary: the source,
                     plus the read-for-ownership of pack writes that miss
@@ -1374,8 +1379,13 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
             sw : list[sw_prefetch]=None) -> analysis:
     """
     Traffic crossing every boundary, bottom up.  Boundary i sits between
-    level i and level i-1 (the core for i=0); what crosses it is the core-side
-    traffic divided by the reuse realised strictly inside it.
+    level i and level i-1 (the core for i=0).  What crosses it is worked out
+    per operand: that operand's core-side traffic, divided by the reuse of
+    its own rungs held strictly inside -- a rung's reuse applies to its
+    invariant operand only, never to the operands streaming past it.  Beyond
+    a resident packed block, the micro-kernel's pass over that operand does
+    not cross at all; packing traffic is handled apart, as the module
+    docstring describes under PACKING.
 
     :param u: microkernel model
     :param b: blocksizes
