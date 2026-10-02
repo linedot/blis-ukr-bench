@@ -33,18 +33,28 @@ Three things can limit a run, and all three are evaluated:
 
   BANDWIDTH   traffic across a boundary against that level's bus width.
 
-  CONCURRENCY A request holds a buffer for as long as its service takes, and
-              that depends on where the line comes from, not on which boundary
-              it crosses.  So the constraint is on buffer-cycles:
+  CONCURRENCY A read holds a buffer at every level it passes through, each
+              from that level's own request until the data is back -- so for
+              as long as the rest of the trip takes, which depends on where
+              the line comes from.  A line from memory holds L2's buffer for
+              the memory latency, L1's for L2 + memory, and the core's queue
+              for all of it.  Each level's buffers are a separate pool with a
+              separate constraint, on buffer-cycles:
 
                   reads   t >= ( N_rd(i)*L(i) + N_rd(i+1)*L(i+1) + ... ) / M_rd
                   writes  t >= N_wr(i)*L(i) / M_wr
 
-              Reads chain -- a line that misses two levels holds the inner
-              buffer for the whole round trip -- so a small fraction of deep
-              misses can consume most of the buffer-cycles.  Writes do not
-              chain: a dirty eviction frees the inner buffer as soon as the
-              next level accepts it.
+              That chaining means a small fraction of deep misses can consume
+              most of the inner buffers' cycles.  Writes do not chain: a dirty
+              eviction frees the inner buffer as soon as the next level
+              accepts it.
+
+              The one exception is a prefetch into an outer level, which is
+              taken to hold only that level's buffers: it passes the inner
+              ones without allocating, which is why it can relieve them.
+              That is implementation-dependent -- if the core tracks such a
+              prefetch in an inner fill buffer until it lands, the relief is
+              not there.
 
   COMPUTE     FLOP / peak, plus the packing kernel's element rate.
 
@@ -2117,7 +2127,10 @@ def report(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
         print(f"{bl.holder:>7}{_pct(bl.rd_cycles, tu):>9}"
               f"{_pct(bl.wr_cycles, tu):>9}{_pct(bp.rd_cycles, tp):>10}"
               f"{_pct(bp.wr_cycles, tp):>10}")
-    print("  reads chain across levels (a memory line pays L2+MEM latency);")
+    print("  a read holds a buffer at every level it passes through, until its "
+          "data is back")
+    print("  (a memory line holds L2's for MEM latency, L1's for L2+MEM, the "
+          "core's for all);")
     print("  writes do not (the inner buffer frees as soon as the next level "
           "takes it)")
     receiver = 'core'
