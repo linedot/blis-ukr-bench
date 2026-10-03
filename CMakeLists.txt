@@ -97,3 +97,23 @@ endif()
 # --- OpenMP ---
 find_package(OpenMP REQUIRED)
 target_link_libraries(blis_ukr_bench PRIVATE OpenMP::OpenMP_CXX)
+
+# --- GOTO-nest harness ---
+# BLIS's own micro-kernel and pack kernel in a loop nest that can be cut at
+# any rung, for validating model.py bottom up.  Single-threaded.
+set(GOTO_SOURCES goto_bench.cpp)
+if(USE_PERF_COUNTERS)
+    list(APPEND GOTO_SOURCES "performance_counters/performance_counters_${PC_BACKEND}.cpp")
+endif()
+add_executable(goto_bench ${GOTO_SOURCES})
+target_include_directories(goto_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${BLIS_INCLUDE_DIR} ${EXTRA_INCLUDES})
+target_link_libraries(goto_bench PRIVATE ${BLIS_LIBRARY} ${EXTRA_LIBS} OpenMP::OpenMP_CXX)
+if(EXTRA_CFLAGS)
+    target_compile_options(goto_bench PRIVATE ${EXTRA_CFLAGS})
+endif()
+if(USE_PERF_COUNTERS)
+    target_compile_definitions(goto_bench PRIVATE GOTOBENCH_HAVE_COUNTERS)
+endif()
+if(AOCL_MATCH)
+    target_compile_definitions(goto_bench PRIVATE AOCL_BLIS)
+endif()

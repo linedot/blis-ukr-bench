@@ -1,0 +1,159 @@
+GOTO-nest harness
+=================
+
+`goto_bench` drives BLIS's own micro-kernel and pack kernel through a GOTO loop
+nest that can be cut at any rung and rearranged, so each rung of `model.py`'s
+ladder can be measured on its own, bottom up. Its flags follow `model.py`
+wherever the concept is the same, so any run can be replayed through the model.
+
+```
+jc: for n   step n_c          [pack B, if placed here]
+  pc: for k   step k_c        [pack B_c / A, if here]
+    ic: for m   step m_c      [pack A_c, if here]
+      jr: for n_c step n_r
+        ir: for m_c step m_r
+          micro-kernel, k_c steps
+```
+
+Build: `cmake --build .` builds it next to `bench` (target `goto_bench`).
+Single-threaded; pin it with `--cpu N` or `taskset`.
+
+Examples
+--------
+
+```
+# full GEMM, BLIS's packing placement
+goto_bench --size 4000 4000 4000 --kc 160 --mc 256 --nc 2000
+
+# one macro-kernel, packed blocks prepared outside the timed region
+goto_bench --size 4000 4000 4000 --kc 160 --mc 256 --nc 2000 --top jr
+
+# the micro-kernel alone (sweep --kc for peak and per-call overhead)
+goto_bench --size 16 32 128 --kc 128 --mc 16 --nc 32 --top ukr
+
+# pack rate of one A_c / B_c block
+goto_bench --size 256 2000 160 --kc 160 --mc 256 --nc 2000 --top packA
+
+# next C tile into L2, and next_b (B_r of the next jr, one call ahead)
+goto_bench ... --prefetch ir:C:L2 jr:B:L2:keep:1
+
+# counters, as found by probe_events.py
+goto_bench ... --events-file events.txt --group 4
+
+# correctness: against a plain loop (small sizes), or the library's own GEMM
+goto_bench --size 203 147 131 --kc 37 --mc 44 --nc 60 --pack A:pc,B:jc --verify
+goto_bench --size 4000 4000 4000 --kc 160 --mc 256 --nc 2000 --verify-lib
+```
+
+Options
+-------
+
+* `--top ukr|ir|jr|ic|pc|jc` -- outermost rung executed. Rungs above it run one
+  iteration; packing placed above it happens once, outside the timed region.
+  `packA` / `packB` time one block's packing alone.
+* `--pack A:R,B:R` -- where packing happens: A at `ic` (BLIS), `pc`, `jc` or
+  `pre`; B at `pc` (BLIS), `jc` or `pre`. `pre` packs once, untimed.
+* `--prefetch loop:operand:target[:hint[:lead]]` -- same syntax as `model.py`.
+  Issued between micro-kernel calls, for what the *next* iteration of `loop`
+  uses in execution order (crossing loop boundaries, so `ir:C` reaches the
+  next column's first tile). If the operand is packed above that loop, the
+  packed block is prefetched; otherwise the source its next pack will read.
+  `lead` is in micro-kernel calls before the end of the loop's iteration;
+  default: issued at its start, i.e. one iteration ahead. C is prefetched for
+  writing. The k-loop is inside the kernel and cannot be prefetched from here.
+* `--c-layout rm|cm`, `--beta general|one|zero|X`, `--alpha X`. A and B are
+  column-major.
+* `--events E,E,...` / `--events-file F`, `--group N`, `--cycles-event E` --
+  counters are measured in groups of N, each its own pass, each led by the
+  cycle counter: one group with more events than the PMU has counters would
+  never be scheduled.
+* `--reps N` / `--min-time S`, `--warmup N`, `--inner N` -- `inner` repeats
+  the region inside each timed measurement (default: enough for ~200 us), so
+  small regions are not timer-bound. Every reported value is per region run.
+* `--verify`, `--verify-lib` -- run the region once and compare it with a
+  plain triple loop, or with the linked library's `cblas_dgemm` -- its
+  `bli_dgemm` if it was built without CBLAS, which is BLIS's default
+  (`configure --enable-cblas`). Both may be given. The library reference is
+  fast enough for full-size problems, and with the library's own default
+  blocking the two results agree bit for bit.
+* `--cpu N`, `--hugepages`, `--line BYTES`, `--label TEXT`.
+
+Output is `# key: value` metadata, then a CSV header and one row.
+
+What each ISA can prefetch
+--------------------------
+
+The header prints what each requested prefetch became on this build.
+
+* AArch64: `PRFM {PLD,PST}{L1,L2,L3}{KEEP,STRM}` -- every combination.
+* x86-64: `prefetcht0/t1/t2` choose L1/L2/L3; `strm` is `prefetchnta` and
+  write intent is `prefetchw`, both without level control.
+* RISC-V: Zicbop `prefetch.r/.w`, with a Zihintntl hint in front for the
+  level: `ntl.p1` for L2 (skips the innermost private level), `ntl.pall` for
+  L3 (skips every private level, so it lands in the innermost shared one --
+  L2 where L2 is shared, as on K1). No strm/keep distinction: `strm` is
+  ignored. Both are base-ISA HINT encodings, emitted raw: no `-march` flag
+  needed, and a core without the extensions executes them as no-ops.
+
+Every prefetch is inline `asm volatile`. GCC's tree DCE removed
+`__builtin_prefetch` from this code once it was inlined -- silently, which
+its documentation allows -- so the builtin is only a last resort for ISAs
+without an asm path, and the header says so.
+
+Counters: probe_events.py
+-------------------------
+
+```
+probe_events.py                 # map model.py's events onto this machine's
+probe_events.py --write events  # events.txt for goto_bench, events.json map
+probe_events.py --list          # every cache/memory/stall event found
+```
+
+Reads `/sys/bus/event_source/devices/*` and, if installed, `perf list -j`, and
+computes encodings as perf does. Arm (Grace, Kunpeng 920): the model's events
+are architected common events with fixed numbers, so the mapping is reliable.
+x86 and RISC-V: the vendor names it looks for are candidates; check `--list`.
+Encodings come out as `PMU:<type>:<config>`, which needs the patched
+`performance_counters` backend. Entries that are not one concrete event are
+skipped and counted: the term syntax recent perf lists for each PMU
+(`ibs_op/ldlat=0..0xfff,.../`), `?` parameters, and values too wide for their
+field. Modifiers (`/u`) and perf's own terms (`period=`) are dropped. Needs
+Python 3.8 or later.
+
+Validating the model: validate.py
+---------------------------------
+
+```
+validate.py detect-cache                              # sizes/lines/ways from sysfs
+validate.py calibrate --bench build/goto_bench [--ghz G] -o calib.json
+validate.py run --bench build/goto_bench --calib calib.json \
+    --cache <model.py spec for this machine> \
+    --size 2000 4000 --kc 128 256 --mc 96 --nc 4096 --top jc \
+    [--prefetch ir:C:L2] [--events-map events.json] -o results.csv
+```
+
+`calibrate` fits the micro-kernel at k small enough to stay in L1 as
+t(k) = C + b*k, giving `--peak` (2*mr*nr/b) and the per-call cost C, which the
+model charges as its epilogue; then times one A_c and one B_c pack in cache for
+`--pack-rate`. Without a cycle counter, cycles come from ns * `--ghz`, and
+peak is then only relative to that clock.
+
+`run` measures every combination of the sweep values and replays each through
+the model with the same blocking, layout, beta, packing and prefetches.
+Packing placed above `--top` is packed outside the region, so the model gets
+`packing.outside`; a region below `jc` repeats on the same data, so the
+smallest cache that holds it is treated as memory (`--no-steady` to turn that
+off). It compares cycles, and FLOP/cycle on the same 2*m*n*k work, plus the
+counters mapped by `--events-map`. Runs with a packing placement other than
+BLIS's are flagged: the model's in-place repacking rule assumes it.
+
+The bandwidths, latencies and buffer counts in `--cache` are not in sysfs and
+come from microbenchmarks or vendor data; `detect-cache` fills in the rest.
+
+Verification
+------------
+
+Build with `-DCMAKE_CXX_FLAGS=-DGOTOBENCH_CHECK_PREFETCH` to abort if any
+prefetched line falls outside the buffer its spec targets -- a wrong prefetch
+address never faults, so it is otherwise invisible. `--verify` then also
+prints how many lines were prefetched.

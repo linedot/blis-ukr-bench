@@ -324,12 +324,17 @@ class packing:
     :param amp_b: bytes fetched for B per byte used on the read side (see
                   module docstring)
     :param rfo: whether a partial cacheline store causes a read-for-ownership
+    :param outside: operands packed outside the modelled region, e.g. 'A' or
+                    'AB' -- packed once and untimed, as when a benchmark
+                    repeats only the rungs below the packing.  They cost no
+                    packing time and no packing traffic.
     """
     rate_a: float = 4.0
     rate_b: float = 4.0
     amp_a: float = 1.0
     amp_b: float = 1.0
     rfo: bool = False
+    outside: str = ''
 
 
     @staticmethod
@@ -966,6 +971,24 @@ def pack_work(u : ukernel, b : blocking, p : problem) -> dict[str,float]:
     }
 
 
+def packed_elems(u : ukernel, b : blocking, p : problem,
+                 pk : packing) -> dict[str,float]:
+    """
+    Elements packed inside the modelled region: pack_work(), less the
+    operands packed outside it.
+
+    :param u: microkernel model
+    :param b: blocksizes
+    :param p: problem sizes
+    :param pk: packing model
+    :return: elements packed per operand
+    """
+    if set(pk.outside) - {'A', 'B'}:
+        raise ValueError(f"packing outside {pk.outside!r}: only A and B are packed")
+    return {op: 0.0 if op in pk.outside else v
+            for op, v in pack_work(u, b, p).items()}
+
+
 def core_traffic(u : ukernel, b : blocking, p : problem,
                  pk : packing) -> traffic:
     """
@@ -981,7 +1004,7 @@ def core_traffic(u : ukernel, b : blocking, p : problem,
     """
     t = make_loop_nest(b, p)
     calls = (p.m / u.m_r) * (p.n / u.n_r) * t.n_pc
-    w = pack_work(u, b, p)
+    w = packed_elems(u, b, p, pk)
     rd = {
         'A': calls * t.k_mean * u.m_r * u.size('A'),
         'B': calls * t.k_mean * u.n_r * u.size('B'),
@@ -1441,7 +1464,7 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
     t = make_loop_nest(b, p)
     flops = 2 * p.m * p.n * p.k + u.epi_flops * p.m * p.n * t.n_pc
     calls = (p.m / u.m_r) * (p.n / u.n_r) * t.n_pc
-    w = pack_work(u, b, p)
+    w = packed_elems(u, b, p, pk)
     t_ukr = calls * u.time(t.k_mean)
     t_pack = ((w['A'] / pk.rate_a if pk.rate_a else 0.0)
               + (w['B'] / pk.rate_b if pk.rate_b else 0.0))
@@ -2715,6 +2738,21 @@ def selftest() -> int:
     chk("instructions count iterations, not lead",
         ev16('ir', 'C', 'L2', 'keep', 16).instr_per_kstep,
         ev16('ir', 'C', 'L2').instr_per_kstep)
+
+    print("\npacking outside the region costs nothing inside it")
+    p17 = problem(2000, 2000, 2000)
+    a_in = analyse(u4, b4, p17, h4, pk4)
+    a_out = analyse(u4, b4, p17, h4, packing(pk4.rate_a, pk4.rate_b,
+                                             outside='AB'))
+    a_a = analyse(u4, b4, p17, h4, packing(pk4.rate_a, pk4.rate_b,
+                                           outside='A'))
+    chk("packed outside: no packing time", a_out.t_pack, 0.0)
+    chk("... and no packing traffic at any boundary",
+        sum(bd.pack_rd + bd.pack_wr for bd in a_out.boundaries), 0.0)
+    chk("... while the micro-kernel's traffic is unchanged",
+        a_out.boundaries[1].ukr_rd, a_in.boundaries[1].ukr_rd)
+    chk("only A outside: B's packing remains",
+        a_a.pack_elems['B'], a_in.pack_elems['B'])
 
     print(f"\n{'ALL CHECKS PASSED' if ok else 'FAILURES ABOVE'}")
     return 0 if ok else 1
