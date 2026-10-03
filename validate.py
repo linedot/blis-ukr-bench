@@ -171,11 +171,24 @@ def cmd_calibrate(a):
     return 0
 
 
-def kernel_from(calib, beta):
+def kernel_from(calib, beta, bcast=''):
     epi = EPI_FLOPS.get(beta, 3)
     mr, nr = calib['mr'], calib['nr']
     return model.ukernel(mr, nr, 8, calib['peak'], epi * mr * nr / calib['epi_cycles'], epi,
-                         beta != 'zero')
+                         beta != 'zero', bcast=bcast.upper())
+
+
+def kernel_prefetches(specs, k_c):
+    """
+    --kernel-prefetch specs that apply at this k_c.  A spec may end in
+    @KMIN, for a prefetch the kernel only issues when k_c >= KMIN.
+    """
+    out = []
+    for s in specs:
+        spec, _, kmin = s.partition('@')
+        if not kmin or k_c >= int(kmin):
+            out.append(model.parse_prefetch(spec))
+    return out
 
 
 def steady_levels(levels, footprint):
@@ -219,7 +232,7 @@ def cmd_run(a):
         events_file = tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False)
         events_file.write('\n'.join(emap.values()) + '\n')
         events_file.close()
-    u = kernel_from(calib, a.beta)
+    u = kernel_from(calib, a.beta, a.bcast)
     pack = dict(kv.split(':') for kv in a.pack.split(','))
     results = []
     print(f"{'top':>4} {'size':>16} {'kc':>5} {'mc':>5} {'nc':>6}  {'measured':>9} {'model':>9} "
@@ -254,10 +267,10 @@ def cmd_run(a):
         p = model.problem(me, ne, ke)
         kc_mean = ke / math.ceil(ke / kc)
         sw = [to_model_prefetch(s, lv, u, kc_mean) for s in a.prefetch]
-        sw += [model.parse_prefetch(s) for s in a.kernel_prefetch]
+        sw += kernel_prefetches(a.kernel_prefetch, kc)
         hw = model.hw_prefetcher(a.pf_streams, a.pf_min_run, a.pf_level.upper())
         an = model.analyse(u, b, p, lv, pk, True, a.core_mshr, hw,
-                           a.c_layout, sw)
+                           a.c_layout, sw, a.lookahead)
         pred = model.predict(an)
         fm, fp = work / meas, work / pred.time
         res = {'top': top, 'm': me, 'n': ne, 'k': ke, 'kc': kc, 'mc': mc, 'nc': nc,
@@ -345,9 +358,10 @@ def main(argv=None):
                    help="prefetches goto_bench issues between calls (and the model gets)")
     r.add_argument('--kernel-prefetch', nargs='*', default=[], metavar='PF',
                    help="prefetches inside the micro-kernel, for the model only, in "
-                        "model.py's syntax (lead in k-steps), e.g. ir:C:L1:keep:32 "
-                        "for AOCL's 8x24 dgemm kernel, which prefetches C 32 k-steps "
-                        "before its update")
+                        "model.py's syntax (lead in k-steps); end one in @KMIN if the "
+                        "kernel issues it only when k_c >= KMIN.  AOCL's 8x24 dgemm "
+                        "kernel prefetches its C tile 100-128 k-steps ahead, and only "
+                        "for k_c >= 128: ir:C:L1:keep:100@128")
     r.add_argument('--pf-streams', type=int, default=0,
                    help="hardware prefetcher streams, as model.py (0: not modelled)")
     r.add_argument('--pf-min-run', type=int, default=4,
@@ -355,6 +369,12 @@ def main(argv=None):
     r.add_argument('--pf-level', default='',
                    help="level the hardware prefetcher fills, e.g. L1 or L2")
     r.add_argument('--core-mshr', type=int, default=0)
+    r.add_argument('--bcast', default='', metavar='OPERANDS',
+                   help="operands the kernel's k-loop loads as broadcasts (A for "
+                        "AOCL's 8x24 dgemm kernel), for the L1D_CACHE uop counts")
+    r.add_argument('--lookahead', type=float, default=0.0, metavar='CYCLES',
+                   help="cycles before the epilogue the core can issue its C loads, "
+                        "as model.py --lookahead")
     r.add_argument('--vl', type=int, default=64,
                    help="vector length in bytes, for the model's L1D_CACHE uop counts: "
                         "64 for SME or AVX-512, 32 for AVX2 or 256-bit RVV, 16 for NEON")

@@ -170,14 +170,32 @@ off). It compares cycles, and FLOP/cycle on the same 2*m*n*k work, plus the
 counters mapped by `--events-map`: the model's events with their ratio, the
 others as measured only. `--vl` sets the vector length the model's
 `L1D_CACHE` uop counts assume (64 B for SME or AVX-512, 32 for AVX2 or 256-bit
-RVV, 16 for NEON); they also assume both panels are loaded as vectors, so for a
-kernel that broadcasts B element by element, `L1D_CACHE` undercounts.
+RVV, 16 for NEON), and `--bcast` the operands the k-loop loads element by
+element: AOCL's 8x24 dgemm kernel broadcasts the 8 values of A and loads B as
+three vectors, 11 loads per k-step where vectors throughout would be 4.
 
 The model sees only the prefetches goto_bench issues, unless told more:
 `--kernel-prefetch` takes prefetches inside the micro-kernel, in model.py's
-syntax with the lead in k-steps (AOCL's 8x24 dgemm kernel prefetches its C
-tile 32 k-steps before the update: `ir:C:L1:keep:32`), and `--pf-streams`,
-`--pf-min-run`, `--pf-level` describe the hardware prefetcher as in model.py.
+syntax with the lead in k-steps, and `--pf-streams`, `--pf-min-run`,
+`--pf-level` describe the hardware prefetcher as in model.py. A kernel may
+prefetch only above some k_c; end the spec in `@KMIN` for that. AOCL's 8x24
+dgemm kernel prefetches its C tile only once k/4 exceeds its 24-iteration
+tail, i.e. for k_c >= 128, then 100-128 k-steps ahead: `ir:C:L1:keep:100@128`.
+Below that it prefetches nothing, so its C fetch is exposed every call.
+
+The model charges that exposed fetch in series with the k-loop: the C tile's
+lines from beyond L1, in waves through the tightest buffer pool on their way,
+times the latency left after any prefetch, less `--lookahead` (how far ahead
+of the epilogue the core issues the C loads; default 0). With a memory-bound
+C, this term usually binds, and its two unknowns separate on the counters: the
+mean L1 miss latency (`L1D_MISS_OCCUPANCY / L1D_CACHE_REFILL`) gives the
+latency, and the time per call then gives the waves, i.e. the buffer count.
+
+The residency test charges each streamer what one iteration of the loop
+touches: for `jr` the whole C strip (m_c x n_r), for `ic` the whole C block
+(m_c x n_c), because under LRU every line of it competes with the invariant
+until the invariant is used again. A_c and B_c that fit alone can be evicted
+by C streaming past them.
 
 A block that is not a multiple of the register block wastes compute: the
 micro-kernel always computes a whole m_r x n_r tile, so with m_c = 4 and

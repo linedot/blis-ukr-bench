@@ -29,7 +29,8 @@ them.  So once jr:A is held in L2, A's traffic beyond L2 is divided by
 n_c/n_r, and B's and C's are untouched.  Packing traffic is not divided by
 reuse; see PACKING.  Reads and writes are tracked separately end to end.
 
-Three things can limit a run, and all three are evaluated:
+Three things can limit a run, and all three are evaluated, plus one latency
+that is paid in series with them:
 
   BANDWIDTH   traffic across a boundary against that level's bus width.
 
@@ -57,6 +58,21 @@ Three things can limit a run, and all three are evaluated:
               not there.
 
   COMPUTE     FLOP / peak, plus the packing kernel's element rate.
+
+  EXPOSURE    The C tile is read whole by the epilogue, so its misses do not
+              overlap with the k-loop the way A's and B's do: unless a
+              prefetch brought it in, the call waits for the last of its
+              lines.  They pass the tightest buffer pool on their path in
+              waves, so per call
+
+                  t_exposed = ceil(lines / M) * latency - lookahead
+
+              added to the call's compute -- in series, not as a fourth
+              ceiling.  A timely prefetch into L1 removes it, one into L2
+              leaves L2's latency; `lookahead` is how far ahead of the
+              epilogue the core can already issue the C loads.  For very
+              small k_c, where the core can run the next call's whole k-loop
+              during the wait, this is pessimistic.
 
 PHASES.  Packing and the micro-kernel do not overlap in single-threaded BLIS,
 and pack traffic is not spread over the whole run -- it all happens inside
@@ -134,6 +150,7 @@ Usage:
 from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import argparse
+import math
 
 
 # ---------------------------------------------------------------- inputs ---
@@ -222,6 +239,10 @@ class ukernel:
                   {'A': 1, 'B': 1, 'C': 4} for int8 inputs accumulating into
                   int32.  peak and epi_peak are then in that precision's
                   operations per cycle.
+    :param bcast: Operands the k-loop loads element by element, as
+                  broadcasts: one load per element rather than one per
+                  vector.  AOCL's 8x24 dgemm kernel broadcasts A.  Only the
+                  L1D_CACHE uop counts depend on it.
     """
     m_r: int
     n_r: int
@@ -232,6 +253,7 @@ class ukernel:
     epi_flops: int = 3
     c_read: bool = True
     sizes: dict[str, int] = field(default_factory=dict)
+    bcast: str = ''
 
     def size(self, op : str) -> int:
         """
@@ -392,8 +414,12 @@ class goto_rung:
     :param loop: name of the loop
     :param operand: which block it operates on: 'A', 'B' or 'C'
     :param invariant: How many bytes are invariant
-    :param streamers: bytes of one working instance of each operand that
-                      changes across the loop, e.g. one A_r and one C_r for ir
+    :param streamers: bytes each operand that changes across the loop
+                      touches in one iteration of it: one A_r and one C_r for
+                      ir, but the whole C strip (m_c x n_r) for jr, because
+                      its ir loop passes every tile of the strip through the
+                      cache between two uses of the invariant, and under LRU
+                      each of them competes with it
     :param reuse: How many times the invariant is reused
     """
     loop: str
@@ -411,8 +437,9 @@ class goto_rung:
         each other rather than the invariant.  Each is then charged only the
         ways its prefetch window occupies -- normally one -- instead of its
         whole footprint.  That needs the associativity; without it this falls
-        back to the plain-LRU footprint: the invariant plus one working
-        instance of each streamer, which is also what an empty `strm` gives.
+        back to the plain-LRU footprint: the invariant plus everything each
+        streamer touches in one iteration, which is also what an empty
+        `strm` gives.
 
         :param level: the level being checked
         :param strm: ways each streaming-inserted operand occupies here
@@ -678,6 +705,7 @@ class analysis:
     strm: dict[str, dict[str, int]] = field(default_factory=dict)
     evals: list[prefetch_eval] = field(default_factory=list)
     pf_cover: dict[str, dict[str, float]] = field(default_factory=dict)
+    lookahead: float = 0.0
 
     @property
     def nest(self) -> loop_nest:
@@ -975,13 +1003,20 @@ def make_goto_ladder(u : ukernel, b : blocking, p : problem) -> list[goto_rung]:
     B_c = t.k_c * t.n_c * sb
     C_p = p.m * t.n_c * sc
     A_f = p.m * p.k * sa
+    # what one iteration of each loop touches of the operands it streams:
+    # the jr loop's ir loop passes a whole C strip through, the ic loop's
+    # jr loop a whole C block, pc all of A's blocks, jc all of B's
+    C_s = t.m_c * u.n_r * sc
+    C_c = t.m_c * t.n_c * sc
+    A_p = p.m * t.k_c * sa
+    B_p = p.k * t.n_c * sb
     return [
         # calls per ir loop and jr iterations per jc block, whole tiles
         goto_rung('ir', 'B', B_r, {'A': A_r, 'C': C_r}, tm / t.n_ic),
-        goto_rung('jr', 'A', A_c, {'B': B_r, 'C': C_r}, tn / t.n_jc),
-        goto_rung('ic', 'B', B_c, {'A': A_c, 'C': C_r}, t.n_ic),
-        goto_rung('pc', 'C', C_p, {'A': A_c, 'B': B_c}, t.n_pc),
-        goto_rung('jc', 'A', A_f, {'B': B_c, 'C': C_p}, t.n_jc),
+        goto_rung('jr', 'A', A_c, {'B': B_r, 'C': C_s}, tn / t.n_jc),
+        goto_rung('ic', 'B', B_c, {'A': A_c, 'C': C_c}, t.n_ic),
+        goto_rung('pc', 'C', C_p, {'A': A_p, 'B': B_c}, t.n_pc),
+        goto_rung('jc', 'A', A_f, {'B': B_p, 'C': C_p}, t.n_jc),
     ]
 
 
@@ -1442,7 +1477,7 @@ def _pack_crossing(tr : traffic, resident : set[str],
 def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
             pk : packing=None, write_allocate : bool=True, core_mshr : int=0,
             pf : hw_prefetcher=None, c_layout : str='rm',
-            sw : list[sw_prefetch]=None) -> analysis:
+            sw : list[sw_prefetch]=None, lookahead : float=0.0) -> analysis:
     """
     Traffic crossing every boundary, bottom up.  Boundary i sits between
     level i and level i-1 (the core for i=0).  What crosses it is worked out
@@ -1550,7 +1585,8 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
                   write_allocate=write_allocate, core=core, rungs=rungs,
                   boundaries=bounds, c_layout=c_layout, streams=shape,
                   cov=coverage(shape, pf), pack_elems=w, flops=flops,
-                  calls=calls, t_ukr=t_ukr, t_pack=t_pack, sw=sw, strm=strm)
+                  calls=calls, t_ukr=t_ukr, t_pack=t_pack, sw=sw, strm=strm,
+                  lookahead=lookahead)
     # the latency effect needs the traffic, so it comes last
     an.evals = [evaluate_prefetch(an, sp) for sp in sw]
     _apply_prefetch(an)
@@ -1632,6 +1668,42 @@ def _buffer_cycles(an : analysis, phase : str='ukr'):
     return out
 
 
+def c_exposure(an : analysis) -> tuple:
+    """
+    Cycles per call the epilogue waits for its C tile, in series with the
+    k-loop.  A and B are read progressively, so their misses overlap with
+    the k-loop's compute; the C tile is read whole at the end of the call,
+    and the epilogue cannot finish before the last of its lines is in.  Its
+    misses are issued when the core reaches the epilogue -- `lookahead`
+    cycles earlier, as far as the core sees ahead -- and they go through the
+    tightest buffer pool on their way in waves of that pool's size.  Only a
+    prefetch hides this: a timely one into L1 removes it, one into L2 leaves
+    L2's latency.
+    :param an: analysis of the configuration
+    :return: (exposed cycles per call, C lines per call from beyond L1,
+              waves, mean latency per line after prefetching)
+    """
+    bds = an.boundaries
+    c1 = bds[1].rd.get('C', 0.0) if len(bds) > 1 else 0.0
+    if c1 <= 0 or not an.calls:
+        return 0.0, 0.0, 0, 0.0
+    idx = {bd.level.name: i for i, bd in enumerate(bds)}
+    # latency each boundary adds, for the C bytes still crossing it unhidden
+    left = {j: bds[j].rd.get('C', 0.0) * _kept(an, 'C', -1, j, idx)
+            for j in range(1, len(bds))}
+    lat = sum(v * bds[j].level.lat for j, v in left.items()) / c1
+    if lat <= 0:
+        return 0.0, c1 / an.calls / bds[0].level.line, 0, 0.0
+    n = c1 / an.calls / bds[0].level.line
+    # the pools the burst holds: the core's queue, then the fill buffers of
+    # every level up to the deepest one it still comes from unhidden
+    deep = max(j for j, v in left.items() if v > 0)
+    pools = [an.core.mshr] + [bds[i].level.mshr for i in range(deep)]
+    m = min((q for q in pools if q), default=0)
+    waves = max(1, math.ceil(n / m - 1e-9)) if m else 1
+    return max(0.0, waves * lat - an.lookahead), n, waves, lat
+
+
 def phase_time(an : analysis, phase : str) -> phase_result:
     """
     Roofline for one phase: its own compute time, its own traffic against
@@ -1642,6 +1714,11 @@ def phase_time(an : analysis, phase : str) -> phase_result:
     :return: the phase's duration, and the term that set it
     """
     terms = [(_pick_phase(phase, an.t_ukr, an.t_pack), f'{phase} compute')]
+    if phase == 'ukr':
+        ex = c_exposure(an)[0]
+        if ex > 0:
+            terms.append((an.t_ukr + an.calls * ex,
+                          'ukr: compute + exposed C fetch'))
     for bd in an.boundaries:
         L = bd.level
         rd, wr = bd.phase_rd(phase), bd.phase_wr(phase)
@@ -2022,7 +2099,7 @@ def _rerun(an : analysis, sw : list[sw_prefetch]=None,
     return analyse(an.kernel, blocks or an.blocks, an.sizes,
                    [bd.level for bd in an.boundaries], an.pk,
                    an.write_allocate, an.core.mshr, an.pf, an.c_layout,
-                   an.sw if sw is None else sw)
+                   an.sw if sw is None else sw, an.lookahead)
 
 
 def report_prefetch(an : analysis, pred : prediction):
@@ -2085,7 +2162,7 @@ def report_prefetch(an : analysis, pred : prediction):
 def report(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
            pk : packing=None, wa : bool=True, core_mshr : int=0,
            pf : hw_prefetcher=None, c_layout : str='rm',
-           sw : list[sw_prefetch]=None) -> analysis:
+           sw : list[sw_prefetch]=None, lookahead : float=0.0) -> analysis:
     """
     Analyse one configuration and print the full breakdown: traffic per
     boundary, stream shapes, the two phases, buffer occupancy, software
@@ -2104,7 +2181,7 @@ def report(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
     :param sw: software prefetches
     :return: the analysis, so that --counters can reuse it
     """
-    an = analyse(u, b, p, levels, pk, wa, core_mshr, pf, c_layout, sw)
+    an = analyse(u, b, p, levels, pk, wa, core_mshr, pf, c_layout, sw, lookahead)
     pred = predict(an)
     pk, G = an.pk, 2 ** 30
     print(f"micro-kernel {u.m_r}x{u.n_r}  s={_fmt_sizes(u)}  peak={u.peak} FLOP/cy  "
@@ -2129,6 +2206,11 @@ def report(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
           f"= ukr {an.t_ukr/1e6:.1f} + pack {an.t_pack/1e6:.1f} "
           f"({100*an.t_pack/an.t_ideal:.0f}% packing)  for "
           f"{an.flops/1e9:.1f} GFLOP")
+    ex, n_c, waves, lat_c = c_exposure(an)
+    if ex > 0:
+        print(f"C epilogue: {n_c:.1f} lines/call from beyond "
+              f"{an.boundaries[0].level.name}, {waves} wave(s) x {lat_c:.0f} cy"
+              f" - lookahead {an.lookahead:.0f} = {ex:.0f} cy exposed per call")
     print(f"core <- L1 : {an.core_rd/an.t_ideal:5.1f} B/cy read, "
           f"{an.core_wr/an.t_ideal:5.1f} B/cy write\n")
 
@@ -2259,7 +2341,10 @@ def counters(an : analysis, vl : int=64) -> pmu_prediction:
     pred = predict(an)
 
     sa, sb, sc = u.size('A'), u.size('B'), u.size('C')
-    uops_ld = an.calls * (an.nest.k_mean * (u.m_r * sa + u.n_r * sb) / vl
+    # one load per vl bytes, or per element for a broadcast operand
+    per_k = sum(n if op in u.bcast else n * s / vl
+                for op, n, s in (('A', u.m_r, sa), ('B', u.n_r, sb)))
+    uops_ld = an.calls * (an.nest.k_mean * per_k
                           + (u.m_r * u.n_r * sc / vl if u.c_read else 0))
     uops_st = an.calls * u.m_r * u.n_r * sc / vl
     w = an.pack_elems
@@ -2543,8 +2628,15 @@ def selftest() -> int:
     p4 = problem(2000, 2000, 2000)
     b4, pk4 = blocking(160, 512, 800), packing.preset('vector', 8)
     kb = sw_prefetch('k', 'B', 'L1', 'keep', 8)
-    q0 = predict(analyse(u4, b4, p4, h4, pk4, core_mshr=16))
-    q1 = predict(analyse(u4, b4, p4, h4, pk4, core_mshr=16, sw=[kb]))
+    # m_c = 448 keeps A_c (560K) resident in L2 with B_r and the C strip that
+    # streams past it each jr iteration (112K); at 512 they would not fit and
+    # A would come from memory.  The buffer limits are tested on their own:
+    # with unlimited lookahead the C fetch overlaps, as before the model had
+    # an exposure term
+    b4v, inf = blocking(160, 448, 800), math.inf
+    q0 = predict(analyse(u4, b4v, p4, h4, pk4, core_mshr=16, lookahead=inf))
+    q1 = predict(analyse(u4, b4v, p4, h4, pk4, core_mshr=16, sw=[kb],
+                         lookahead=inf))
     chk("L1 prefetch helps when the core queue is what binds",
         float(q1.flop_per_cycle > q0.flop_per_cycle + 1), 1.0)
     chk("... and the verdict names the queue it relieved",
@@ -2567,7 +2659,7 @@ def selftest() -> int:
     # 3-line minimum run the prefetcher covers C in one layout only, so the
     # layout changes the answer -- otherwise this test could not fail
     hw = hw_prefetcher(20, 3, 'L2')
-    a_rm, a_cm = (analyse(u4, b4, p4, h4, pk4, pf=hw, c_layout=cl, sw=[kb])
+    a_rm, a_cm = (analyse(u4, b4v, p4, h4, pk4, pf=hw, c_layout=cl, sw=[kb])
                   for cl in ('rm', 'cm'))
     chk("the C layout changes this prediction (so the next check can fail)",
         float(abs(predict(a_rm).flop_per_cycle
@@ -2696,7 +2788,8 @@ def selftest() -> int:
     u10, b10 = ukernel(16, 32, 8, 128.0, 32.0, 3, True), blocking(160, 256, 8000)
     p10 = problem(8000, 8000, 8000)
     q = predict(analyse(u10, b10, p10, h4, pk4, core_mshr=16,
-                        sw=[sw_prefetch('k', 'B', 'L1', 'keep', 1)]))
+                        sw=[sw_prefetch('k', 'B', 'L1', 'keep', 1)],
+                        lookahead=math.inf))
     chk("d=1 B prefetch: core queue binds, tied with the L1 fill buffers",
         float(q.bound == 'ukr: core load queue'
               and q.tied == ['ukr: L1 fill buffers']), 1.0)
@@ -2720,8 +2813,10 @@ def selftest() -> int:
     chk("write-backs do not depend on n_c while A_c is resident",
         float(len({round(at_mem(nc)[1].tot_wr) for nc in (8000, 1024, 512)})),
         1.0)
-    a12, m12 = at_mem(256)
-    chk("n_c = 256 makes B_c resident too: no B from memory either",
+    # B_c must fit with A_c and the C block each ic iteration streams past
+    # it: 160K + 320K + 256K at n_c = 128 (at 256: 320K + 320K + 512K)
+    a12, m12 = at_mem(128)
+    chk("n_c = 128 makes B_c resident too: no B from memory either",
         float(any(r.loop == 'ic' for r in a12.boundaries[1].holds)
               and m12.rd['B'] == 0.0 and m12.tot_wr == m12.wr['C']), 1.0)
 
@@ -2840,6 +2935,37 @@ def selftest() -> int:
     edge = analyse(u8, blocking(64, 64, 20), problem(64, 20, 64), lv, free)
     chk("n = 20, n_r = 8: 3 column tiles, not 2.5", edge.calls, 8 * 3)
 
+    print("\nan un-prefetched C tile is fetched in series with the k-loop")
+    lv = parse_hierarchy('32K:64::-1::16:5;1M:64::-1::4:18;INF:::-1:::150')
+    an = analyse(u, b, p, lv, free)
+    ex, n_c, waves, _ = c_exposure(an)
+    chk("C lines per call from memory: 8*8*8/64", n_c, 8)
+    chk("waves through L2's 4 buffers: ceil(8/4)", waves, 2)
+    chk("exposed per call == 2 * (18 + 150)", ex, 2 * (18 + 150))
+    chk("... in series: ukr phase == t_ukr + calls * exposed",
+        predict(an).ukr.time, an.t_ukr + an.calls * ex)
+    ahead = analyse(u, b, p, lv, free, lookahead=100)
+    chk("lookahead 100 hides 100 of it", c_exposure(ahead)[0], ex - 100)
+    to_l2 = analyse(u, b, p, lv, free, sw=[parse_prefetch('ir:C:L2')])
+    chk("prefetched into L2: one wave of L2 latency", c_exposure(to_l2)[0], 18)
+    to_l1 = analyse(u, b, p, lv, free, sw=[parse_prefetch('ir:C:L1')])
+    chk("prefetched into L1: nothing exposed", c_exposure(to_l1)[0], 0)
+
+    print("\na streamer is charged what one iteration of the loop touches")
+    bs = blocking(8, 256, 1024)
+    jr = [r for r in make_goto_ladder(u, bs, p) if r.loop == 'jr'][0]
+    chk("jr: A_c + B_r + the whole C strip (m_c x n_r)",
+        jr.need_at(lv[0], {}), (256 * 8 + 8 * 8 + 256 * 8) * 8)
+
+    print("\na broadcast operand costs one load per element")
+    ub = ukernel(8, 24, 8, 32.0, 32.0, 3, True, bcast='A')
+    outside = packing(0, 0, 1, 1, False, outside='AB')
+    pq = problem(96, 240, 64)
+    ab = analyse(ub, blocking(64, 96, 240), pq, parse_hierarchy('INF:::-1'), outside)
+    rd = counters(ab, 64).events['L1D_CACHE_RD']
+    chk("8x24, A broadcast: 8 + 3 loads per k-step, 24 per C tile",
+        (rd - ab.calls * 24) / (ab.calls * 64), 11)
+
     print("\nmiss occupancy chains the latencies: a mean L1 miss pays the L2")
     print("latency, plus the memory latency for the share that misses L2 too")
     lv = parse_hierarchy('32K:64::-1::16:5;1M:64::-1::32:18;INF:::-1:::150')
@@ -2921,6 +3047,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "(64-128) than an L1 fill-buffer count.  Stores go "
                          "through the store queue and are not counted.  "
                          "0 = not modelled.")
+    ap.add_argument('--bcast', default='', metavar='OPERANDS',
+                    help="operands the k-loop loads as broadcasts, one load per "
+                         "element: A for AOCL's 8x24 dgemm kernel.  Only the "
+                         "L1D_CACHE uop counts depend on it.")
+    ap.add_argument('--lookahead', type=float, default=0.0, metavar='CYCLES',
+                    help="cycles before the epilogue the core can already issue "
+                         "its C loads.  An un-prefetched C tile is fetched in "
+                         "series with the k-loop, less this.  Default 0.")
     ap.add_argument('--pf-streams', type=int, default=0,
                     help='streams the hardware prefetcher can track; 0 = none')
     ap.add_argument('--pf-min-run', type=int, default=4,
@@ -2991,7 +3125,7 @@ def _make_kernel(ap : argparse.ArgumentParser,
         ap.error(f"--s: {e}")
     epi = {'general': 3, 'one': 2, 'zero': 1}[a.beta]
     return ukernel(a.mr, a.nr, sizes['A'], a.peak, a.epi_peak, epi,
-                   c_read=a.beta != 'zero', sizes=sizes)
+                   c_read=a.beta != 'zero', sizes=sizes, bcast=a.bcast.upper())
 
 
 def main(argv : list[str]=None) -> int:
@@ -3037,7 +3171,8 @@ def main(argv : list[str]=None) -> int:
         sweep(analyse(u, b, p, lv, pk, wa, a.core_mshr, pf, a.c_layout, sw),
               a.sweep)
     else:
-        an = report(u, b, p, lv, pk, wa, a.core_mshr, pf, a.c_layout, sw)
+        an = report(u, b, p, lv, pk, wa, a.core_mshr, pf, a.c_layout, sw,
+                    a.lookahead)
         if a.counters:
             report_counters(an, a.vl)
     return 0
