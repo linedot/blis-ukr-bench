@@ -66,7 +66,9 @@ Options
 * `--events E,E,...` / `--events-file F`, `--group N`, `--cycles-event E` --
   counters are measured in groups of N, each its own pass, each led by the
   cycle counter: one group with more events than the PMU has counters would
-  never be scheduled.
+  never be scheduled. Each event is first opened on its own beside the cycle
+  counter; one the kernel refuses is skipped with a warning naming it, so it
+  costs neither the rest of its group nor the cycles.
 * `--reps N` / `--min-time S`, `--warmup N`, `--inner N` -- `inner` repeats
   the region inside each timed measurement (default: enough for ~200 us), so
   small regions are not timer-bound. Every reported value is per region run.
@@ -112,8 +114,17 @@ probe_events.py --write events  # events.txt for goto_bench, events.json map
 probe_events.py --list          # every cache/memory/latency event found
 ```
 
-Reads `/sys/bus/event_source/devices/*` and, if installed, `perf list -j`, and
-computes encodings as perf does. Each event has candidates in order of
+Reads `/sys/bus/event_source/devices/*` and, if installed, `perf list -j`
+(perf 6.x; an older perf is reported as such), and computes encodings as perf
+does. Every pick is then opened with `perf_event_open` -- directly, no perf
+needed -- and a candidate the kernel refuses is passed over, with the reason
+printed. On Arm, sysfs lists only what the PMU's PMCEID registers advertise,
+which never covers the recommended implementation-defined range 0x40-0xbf
+(`L1D_CACHE_RD/WR` 0x40/0x41, `L2D_CACHE_RD/WR` 0x50/0x51, ...): those are
+tried by number on the core PMU, and kept only if they count something in a
+short memory-touching run. If this process cannot open even the cycle counter
+(`perf_event_paranoid`, no PMU), nothing is checked and the picks say
+unverified; `--no-verify` skips the checks. Each event has candidates in order of
 preference, checked against perf list on Kunpeng 920, Zen 5 and SpacemiT K1;
 a candidate that only approximates the model's meaning is printed with a note
 (`[demand misses only]`). Kernel generic events are taken only where perf

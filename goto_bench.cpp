@@ -325,13 +325,38 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "# warning: built without counters (-DUSE_PERF_COUNTERS=ON); timing only\n");
     groups.push_back({});
 #else
-    if (rest.empty())
-        groups.push_back(o.cycles_event.empty() ? std::vector<std::string>{}
-                                                : std::vector<std::string>{o.cycles_event});
-    for (std::size_t i = 0; i < rest.size(); i += o.group)
+    // An event the kernel cannot open fails its whole group -- and every
+    // group carries the cycle counter.  So open each first, the cycle counter
+    // alone and every other event beside it: only the ones that fail are
+    // lost, and by name.
+    auto opens = [](const std::vector<std::string>& g, std::string& why) {
+        try { performance_counters probe(g); return true; }
+        catch (const std::exception& e) { why = e.what(); return false; }
+    };
+    std::string why, cyc_ev = o.cycles_event;
+    if (!cyc_ev.empty() && !opens({cyc_ev}, why))
     {
-        std::vector<std::string> g{o.cycles_event};
-        for (std::size_t j = i; j < std::min(rest.size(), i + o.group); j++) g.push_back(rest[j]);
+        std::fprintf(stderr, "# warning: cycle counter %s unavailable (%s); cycles from timing only\n",
+                     cyc_ev.c_str(), why.c_str());
+        cyc_ev.clear();
+    }
+    std::vector<std::string> usable;
+    for (const auto& e : rest)
+    {
+        std::vector<std::string> g;
+        if (!cyc_ev.empty()) g.push_back(cyc_ev);
+        g.push_back(e);
+        if (opens(g, why)) usable.push_back(e);
+        else std::fprintf(stderr, "# warning: counter %s unavailable (%s); skipped\n",
+                          e.c_str(), why.c_str());
+    }
+    if (usable.empty())
+        groups.push_back(cyc_ev.empty() ? std::vector<std::string>{} : std::vector<std::string>{cyc_ev});
+    for (std::size_t i = 0; i < usable.size(); i += o.group)
+    {
+        std::vector<std::string> g;
+        if (!cyc_ev.empty()) g.push_back(cyc_ev);
+        for (std::size_t j = i; j < std::min(usable.size(), i + o.group); j++) g.push_back(usable[j]);
         groups.push_back(g);
     }
 #endif

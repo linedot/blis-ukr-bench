@@ -34,9 +34,12 @@ model's event names to the chosen specs, for validate.py.
 """
 
 import argparse
+import ctypes
+import fcntl
 import glob
 import json
 import os
+import platform
 import re
 import signal
 import shutil
@@ -255,20 +258,21 @@ def sysfs_pmus(root):
 
 def perf_list_events():
     """
-    ([(name, 'pmu/terms/')], {every event name perf lists, lowercased}) from
-    `perf list -j`.  The set is None when perf is not there, or when it lists
-    no legacy events at all (an output this script does not understand):
-    then nothing can be ruled out.
+    ([(name, 'pmu/terms/')], {every event name perf lists, lowercased},
+    status) from `perf list -j`.  The set is None when perf is not there, or
+    when it lists no legacy events at all (an output this script does not
+    understand): then nothing can be ruled out.  status is 'ok', 'missing'
+    (no perf), or 'old' (perf without -j, which came in perf 6.x).
     """
     perf = shutil.which('perf')
     if not perf:
-        return [], None
+        return [], None, 'missing'
     try:
         out = subprocess.run([perf, 'list', '-j'], capture_output=True,
                              text=True, timeout=60).stdout
         data = json.loads(out)
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-        return [], None
+        return [], None, 'old'
     found, listed = [], set()
     for ev in data:
         name, enc = ev.get('EventName'), ev.get('Encoding')
@@ -283,7 +287,106 @@ def perf_list_events():
                     listed.add(alias)
     if not listed & {'cpu-cycles', 'cycles', 'instructions'}:
         listed = None
-    return found, listed
+    return found, listed, 'ok'
+
+
+# -- whether the kernel opens an event: perf_event_open(2), called directly,
+# -- so that no perf binary is needed and the answer is the harness's own
+
+class _perf_attr(ctypes.Structure):
+    """struct perf_event_attr up to config2 (PERF_ATTR_SIZE_VER1)"""
+    _fields_ = [('type', ctypes.c_uint32), ('size', ctypes.c_uint32),
+                ('config', ctypes.c_uint64), ('sample_period', ctypes.c_uint64),
+                ('sample_type', ctypes.c_uint64), ('read_format', ctypes.c_uint64),
+                ('flags', ctypes.c_uint64), ('wakeup', ctypes.c_uint32),
+                ('bp_type', ctypes.c_uint32), ('config1', ctypes.c_uint64),
+                ('config2', ctypes.c_uint64)]
+
+
+_NR_PERF_EVENT_OPEN = {'x86_64': 298, 'aarch64': 241, 'riscv64': 241,
+                       'ppc64le': 319, 'ppc64': 319, 's390x': 331}
+_CACHE = {'L1D': 0, 'L1I': 1, 'LL': 2, 'DTLB': 3, 'ITLB': 4, 'BPU': 5, 'NODE': 6}
+_OP = {'READ': 0, 'WRITE': 1, 'PREFETCH': 2}
+_RESULT = {'ACCESS': 0, 'MISS': 1}
+
+
+def attr_of(spec):
+    """goto_bench's event spec -> (perf type, config), None if not known"""
+    if spec.startswith('PMU:'):
+        _, t, c = spec.split(':')
+        return int(t), int(c, 0)
+    if spec.startswith('RAW:'):
+        return 4, int(spec[4:], 0)
+    if spec in ('CYCLES', 'INSTRUCTIONS'):
+        return 0, 0 if spec == 'CYCLES' else 1
+    parts = spec.split('_')
+    if len(parts) == 3 and parts[0] in _CACHE and parts[1] in _OP and parts[2] in _RESULT:
+        return 3, _CACHE[parts[0]] | _OP[parts[1]] << 8 | _RESULT[parts[2]] << 16
+    return None
+
+
+def _touch_memory():
+    """a few milliseconds of loads, stores and misses to count"""
+    s = 0
+    for i in range(100000):
+        s += i
+    buf = bytearray(16 << 20)
+    bytes(memoryview(buf)[::64])                 # a load per line
+    buf[::64] = bytes(len(buf) // 64)            # a store per line
+    return s
+
+
+def try_count(etype, config):
+    """(count over _touch_memory(), None), or (None, why the kernel refused)"""
+    nr = _NR_PERF_EVENT_OPEN.get(platform.machine())
+    if nr is None or not sys.platform.startswith('linux'):
+        return None, 'perf_event_open not known here'
+    attr = _perf_attr(type=etype, size=ctypes.sizeof(_perf_attr), config=config,
+                      flags=1 | 1 << 5 | 1 << 6)   # disabled, exclude kernel, hv
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.syscall(nr, ctypes.byref(attr), 0, -1, -1, 0)
+    if fd < 0:
+        return None, os.strerror(ctypes.get_errno())
+    try:
+        fcntl.ioctl(fd, 0x2403, 0)                 # PERF_EVENT_IOC_RESET
+        fcntl.ioctl(fd, 0x2400, 0)                 # PERF_EVENT_IOC_ENABLE
+        _touch_memory()
+        fcntl.ioctl(fd, 0x2401, 0)                 # PERF_EVENT_IOC_DISABLE
+        return int.from_bytes(os.read(fd, 8), sys.byteorder), None
+    finally:
+        os.close(fd)
+
+
+def make_check():
+    """
+    (check, None): check(spec, need_count) is None for an event this process
+    can open -- and that counts something, if need_count -- else why not.
+    (None, why) if not even the cycle counter opens: then nothing can be
+    checked, and every pick stays unverified.
+    """
+    _, why = try_count(0, 0)
+    if why:
+        return None, why
+
+    def check(spec, need_count):
+        at = attr_of(spec)
+        if at is None:
+            return None
+        n, why = try_count(*at)
+        if why:
+            return f'cannot be opened: {why}'
+        if need_count and not n:
+            return 'opens, but counted nothing'
+        return None
+    return check, None
+
+
+def arm_core_type(pmus):
+    """the type of the Arm core PMU, if there is one"""
+    for name, info in pmus.items():
+        if re.match(r'arm(v8|v9)?_|armv[89]', name) and 'cpu_cycles' in info['events']:
+            return info['type']
+    return None
 
 
 def spec_for(pmu, info, regs):
@@ -340,35 +443,56 @@ def last_level(root):
     return max(levels) if levels else None
 
 
-def choose(table, arm_fallback, listed, llc=None):
+def choose(table, arm_fallback, listed, llc=None, check=None, arm_type=None):
     """
-    {canonical: (spec, where, note)}, None where nothing was found.  A
-    generic event is taken only if perf lists it (listed), or if there is no
-    perf list to tell; a generic last-level-cache event only for the level
-    that is last here (llc; L3 if unknown).
+    ({canonical: (spec, where, note)}, None where nothing was found;
+    {canonical: [candidates rejected, and why]}).  A generic event is taken
+    only if perf lists it (listed), or if there is no perf list to tell; a
+    generic last-level-cache event only for the level that is last here
+    (llc; L3 if unknown).  With check, every candidate is opened first, and
+    one the kernel refuses is passed over.  With arm_type, the architected
+    numbers of events sysfs does not list (Arm lists only what its PMCEID
+    registers advertise, never 0x40 and up: L1D_CACHE_RD ...) are tried on
+    the core PMU, and kept only if they count -- only in 0x40..0xbf, the
+    recommended implementation-defined range: below it, and at 0x4000 and up,
+    sysfs lists what PMCEID advertises, so an absent event is not there (the
+    kernel would still open it raw, to count nothing).
     """
-    chosen = {}
+    chosen, rejected = {}, {}
     for canon, cands in CANONICAL.items():
         pick = None
         for name, note in cands:
+            cand, need = None, False
             if name.startswith('generic:'):
                 spec, perf_name = GENERIC[name.split(':', 1)[1]]
                 if listed is not None and perf_name not in listed:
                     continue                             # the kernel lacks it
                 if spec.startswith('LL_') and not canon.startswith(f'L{llc or 3}D'):
                     continue                             # not this machine's LLC
-                pick = (spec, "kernel's generic event" + (
-                    '' if listed is not None else ', unverified (no perf list)'), note)
-                break
-            if name in table:
-                pick = (*table[name], note)
-                break
-            if arm_fallback and name in ARM_COMMON:
-                pick = (f"RAW:{ARM_COMMON[name]:#x}",
+                cand = (spec, "kernel's generic event" + (
+                    '' if listed is not None else ', opened here' if check
+                    else ', unverified (no perf list)'), note)
+            elif name in table:
+                cand = (*table[name], note)
+            elif (arm_type is not None and check and name in ARM_COMMON
+                  and 0x40 <= ARM_COMMON[name] <= 0xbf):
+                cand = (f"PMU:{arm_type}:{ARM_COMMON[name]:#x}",
+                        f"Arm architected number {ARM_COMMON[name]:#x}, counted here",
+                        note)
+                need = True
+            elif arm_fallback and name in ARM_COMMON:
+                cand = (f"RAW:{ARM_COMMON[name]:#x}",
                         "Arm architected number (sysfs absent)", note)
-                break
+            if cand is None:
+                continue
+            why = check(cand[0], need) if check else None
+            if why:
+                rejected.setdefault(canon, []).append(f"{cand[0]}: {why}")
+                continue
+            pick = cand
+            break
         chosen[canon] = pick
-    return chosen
+    return chosen, rejected
 
 
 def cpuinfo(path):
@@ -415,19 +539,23 @@ def main(argv=None):
     p.add_argument('--sysfs-root', default='/sys',
                    help='where sysfs is mounted (for testing)')
     p.add_argument('--no-perf', action='store_true', help='do not run perf list')
+    p.add_argument('--no-verify', action='store_true',
+                   help='do not open the picked events to check the kernel takes them')
     p.add_argument('--cpuinfo', default='/proc/cpuinfo', help=argparse.SUPPRESS)
     a = p.parse_args(argv)
 
     pmus = sysfs_pmus(a.sysfs_root)
-    perf_events, listed = ([], None) if a.no_perf else perf_list_events()
-    have_perf = not a.no_perf and shutil.which('perf') is not None
+    perf_events, listed, perf_status = (([], None, 'skipped') if a.no_perf
+                                        else perf_list_events())
     table, skipped = candidates(pmus, perf_events)
     listed_pmus = ', '.join('%s (type %d)' % (k, v['type']) for k, v in pmus.items())
     print(f"# PMUs: {listed_pmus or 'none'}")
     print(f"# events: {len(table)} encodable"
           + (f", {len(perf_events)} from perf list" if perf_events else
-             ", perf lists no named events here" if have_perf else
-             ", perf not available" if not a.no_perf else "")
+             ", perf lists no named events here" if perf_status == 'ok' else
+             ", this perf has no 'perf list -j' (older than 6.x): sysfs only"
+             if perf_status == 'old' else
+             ", perf not available" if perf_status == 'missing' else "")
           + (f"; {skipped} skipped as not one concrete event (term ranges, '?' "
              f"parameters, or values or terms the PMU cannot take)" if skipped else ""))
     for h in hints(pmus, perf_events, cpuinfo(a.cpuinfo)):
@@ -443,14 +571,21 @@ def main(argv=None):
         return 0
 
     arm_fallback = not table and os.uname().machine == 'aarch64'
-    chosen = choose(table, arm_fallback or (is_arm(a.sysfs_root) and not table),
-                    listed, last_level(a.sysfs_root))
+    check, why = (None, 'not asked to') if a.no_verify else make_check()
+    if check is None and not a.no_verify:
+        print(f"# note: this process cannot open the cycle counter ({why}): "
+              f"no event could be checked, so the picks are unverified")
+    chosen, rejected = choose(table, arm_fallback or (is_arm(a.sysfs_root) and not table),
+                              listed, last_level(a.sysfs_root), check,
+                              arm_core_type(pmus))
     for canon, pick in chosen.items():
         if pick:
             spec, where, note = pick
             print(f"  {canon:<22} {spec:<20} {where}" + (f"  [{note}]" if note else ""))
         else:
             print(f"  {canon:<22} not found")
+        for r in rejected.get(canon, []):
+            print(f"  {'':<22}   passed over {r}")
     if a.write:
         with open(a.write + '.txt', 'w') as f:
             for canon, pick in chosen.items():

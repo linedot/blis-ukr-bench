@@ -90,7 +90,9 @@ def cycles(row, ghz):
     if c > 0:
         return c, 'cycle counter'
     if not ghz:
-        raise SystemExit("no cycle counter on this machine: pass --ghz to convert ns to cycles")
+        raise SystemExit("no cycles in this run: the cycle counter could not be opened (see "
+                         "goto_bench's warnings above), or this machine has none -- pass "
+                         "--ghz to convert ns to cycles")
     return float(row['ns_min']) * ghz, f'ns * {ghz} GHz'
 
 
