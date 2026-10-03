@@ -163,8 +163,19 @@ validate.py run --bench build/goto_bench --calib calib.json \
 
 `calibrate` fits the micro-kernel at k small enough to stay in L1 as
 t(k) = C + b*k, giving `--peak` (2*mr*nr/b) and the per-call cost C, which the
-model charges as its epilogue; then times one A_c and one B_c pack in cache for
-`--pack-rate`. Without a cycle counter, cycles come from ns * `--ghz`, and
+model charges as its epilogue -- leaving out k < 8, where the per-call work
+overlaps the short k-loop differently; then times one A_c and one B_c pack in
+cache for `--pack-rate`. It also times one `ir` loop in L1 at two k. With
+`--events-map`, the intercepts of loads and stores per call against k, less
+the C tile's, become the default `--call-uops`, and the slope is printed as
+loads per k-step, with the `--bcast` it matches. With `--prefetch`, the same
+runs with goto_bench's prefetch hook give its cycles, loads and stores per
+call; `run` with the same `--prefetch` charges them. The hook's cycles overlap
+the epilogue's wait for C (`model.py --call-extra`): a call costs the larger.
+
+`--cache` latencies are increments along the chain -- what each level adds to
+a miss from the level above -- not load-to-use totals: with totals of 7, 14
+and 46 cycles for L1, L2 and L3 hits, the spec says 7, 7 and 32. Without a cycle counter, cycles come from ns * `--ghz`, and
 peak is then only relative to that clock.
 
 `run` measures every combination of the sweep values and replays each through

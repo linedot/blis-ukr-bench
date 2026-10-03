@@ -43,6 +43,10 @@ that is paid in series with them:
               separate constraint, on buffer-cycles:
 
                   reads   t >= ( N_rd(i)*L(i) + N_rd(i+1)*L(i+1) + ... ) / M_rd
+
+              So a level's latency L is what it adds to a miss from the level
+              above -- an increment, not the load-to-use total.  From measured
+              totals t: L(L1) = t(L1), L(L2) = t(L2) - t(L1), and so on.
                   writes  t >= N_wr(i)*L(i) / M_wr
 
               That chaining means a small fraction of deep misses can consume
@@ -258,6 +262,10 @@ class ukernel:
                     uop counts depend on it -- their time is already in the
                     calibrated per-call cost.
     :param call_st: Stores per call likewise
+    :param call_extra: Cycles per call spent by the caller between calls --
+                       goto_bench's prefetch hook, say.  They overlap with
+                       the epilogue's wait for C, so a call costs the larger
+                       of the two, not their sum.
     """
     m_r: int
     n_r: int
@@ -271,6 +279,7 @@ class ukernel:
     bcast: str = ''
     call_ld: float = 0.0
     call_st: float = 0.0
+    call_extra: float = 0.0
 
     def size(self, op : str) -> int:
         """
@@ -1765,10 +1774,12 @@ def phase_time(an : analysis, phase : str) -> phase_result:
     """
     terms = [(_pick_phase(phase, an.t_ukr, an.t_pack), f'{phase} compute')]
     if phase == 'ukr':
-        ex = c_exposure(an)[0]
-        if ex > 0:
-            terms.append((an.t_ukr + an.calls * ex,
-                          'ukr: compute + exposed C fetch'))
+        # the caller's per-call work runs while the epilogue waits for C
+        ex, extra = c_exposure(an)[0], an.kernel.call_extra
+        if max(ex, extra) > 0:
+            terms.append((an.t_ukr + an.calls * max(ex, extra),
+                          'ukr: compute + exposed C fetch' if ex >= extra
+                          else 'ukr: compute + per-call overhead'))
     for bd in an.boundaries:
         L = bd.level
         rd, wr = bd.phase_rd(phase), bd.phase_wr(phase)
@@ -3023,6 +3034,13 @@ def selftest() -> int:
     to_l1 = analyse(u, b, p, lv, free, sw=[parse_prefetch('ir:C:L1')])
     chk("prefetched into L1: nothing exposed", c_exposure(to_l1)[0], 0)
 
+    print("\nthe caller's per-call work overlaps the epilogue's wait for C")
+    ex0 = c_exposure(an)[0]                      # 336 cycles, from above
+    for extra, want in ((100.0, ex0), (500.0, 500.0)):
+        ax = analyse(replace(u, call_extra=extra), b, p, lv, free)
+        chk(f"call_extra {extra:.0f} vs exposure {ex0:.0f}: a call costs the larger",
+            predict(ax).ukr.time, ax.t_ukr + ax.calls * want)
+
     print("\na software prefetch can hold the inner buffers until it lands")
     held = analyse(u, b, p, lv, free, sw=[parse_prefetch('ir:C:L2')],
                    pf_hold_inner=True)
@@ -3163,6 +3181,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "relieves the core's queue and the epilogue's wait but "
                          "not those buffers.  Zen 5's PREFETCHT1 behaves so by "
                          "its L1 miss-occupancy counter.")
+    ap.add_argument('--call-extra', type=float, default=0.0, metavar='CYCLES',
+                    help="cycles per call the caller spends between calls (a "
+                         "prefetch hook); they overlap with the epilogue's wait "
+                         "for C, so a call costs the larger of the two")
     ap.add_argument('--call-uops', default='0', metavar='LD[/ST]',
                     help="memory uops per call outside the k-loop and the C "
                          "tile: arguments read from memory, saved registers, "
@@ -3244,7 +3266,8 @@ def _make_kernel(ap : argparse.ArgumentParser,
     return ukernel(a.mr, a.nr, sizes['A'], a.peak, a.epi_peak, epi,
                    c_read=a.beta != 'zero', sizes=sizes, bcast=a.bcast.upper(),
                    call_ld=float(a.call_uops.split('/')[0]),
-                   call_st=float((a.call_uops.split('/') + ['0'])[1]))
+                   call_st=float((a.call_uops.split('/') + ['0'])[1]),
+                   call_extra=a.call_extra)
 
 
 def main(argv : list[str]=None) -> int:

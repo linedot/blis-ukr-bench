@@ -142,11 +142,18 @@ def cmd_calibrate(a):
         cyc, src = cycles(row, a.ghz)
         pts.append((k, cyc))
         print(f"  k={k:>5}: {cyc:9.1f} cycles per call")
-    n = len(pts)
-    mk, mc = sum(k for k, _ in pts) / n, sum(c for _, c in pts) / n
-    b = (sum((k - mk) * (c - mc) for k, c in pts) / sum((k - mk) ** 2 for k, _ in pts))
+    # the smallest k overlaps the per-call work with its short k-loop
+    # differently, which bends the line: fit k >= 8 when that leaves three
+    fit = [(k, c) for k, c in pts if k >= 8]
+    if len(fit) < 3:
+        fit = pts
+    elif len(fit) < len(pts):
+        print(f"  (fit leaves out k < 8: {[k for k, _ in pts if k < 8]})")
+    n = len(fit)
+    mk, mc = sum(k for k, _ in fit) / n, sum(c for _, c in fit) / n
+    b = (sum((k - mk) * (c - mc) for k, c in fit) / sum((k - mk) ** 2 for k, _ in fit))
     c0 = mc - b * mk
-    worst = max(abs(c0 + b * k - c) / c for k, c in pts)
+    worst = max(abs(c0 + b * k - c) / c for k, c in fit)
     peak = 2 * mr * nr / b
     print(f"  fit t(k) = {c0:.1f} + {b:.3f}*k   (worst residual {100 * worst:.1f}%)")
     print(f"  -> peak {peak:.2f} FLOP/cycle, {c0:.1f} cycles per call outside the k-loop")
@@ -164,6 +171,7 @@ def cmd_calibrate(a):
              'peak': peak, 'epi_cycles': c0, 'ukr_points': pts, 'fit_worst_residual': worst,
              'pack_rate_a': rates['A'], 'pack_rate_b': rates['B'], 'cycles_source': src,
              'ghz': a.ghz}
+    calib.update(calibrate_in_nest(a, mr, nr, l1))
     with open(a.output, 'w') as f:
         json.dump(calib, f, indent=2)
     print(f"# wrote {a.output}: --peak {peak:.2f} --epi-peak "
@@ -171,10 +179,77 @@ def cmd_calibrate(a):
     return 0
 
 
+def calibrate_in_nest(a, mr, nr, l1):
+    """
+    Per-call costs as the nest sees them: one ir loop of 4 calls, everything
+    resident in L1, at two k.  With --events-map, loads and stores per call
+    against k: the intercepts, less the C tile's, are --call-uops, the slope
+    is loads per k-step.  With --prefetch, the same with goto_bench's
+    prefetch hook running: the extra cycles, loads and stores per call.
+    """
+    k_hi = 4
+    while (4 * mr * (k_hi + 4) + (k_hi + 4) * nr + 4 * mr * nr) * 8 <= l1 // 2:
+        k_hi += 4
+    ks, out = (max(4, k_hi // 2 // 4 * 4), k_hi), {}
+    emap = json.load(open(a.events_map)) if a.events_map else {}
+    want = {c: emap[c] for c in ('L1D_CACHE_RD', 'L1D_CACHE_WR') if c in emap}
+    ev_args = []
+    if want:
+        f = tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False)
+        f.write('\n'.join(want.values()) + '\n')
+        f.close()
+        ev_args = ['--events-file', f.name, '--group', a.group]
+
+    def per_call(k, pf):
+        args = ['--size', 4 * mr, nr, k, '--kc', k, '--mc', 4 * mr, '--nc', nr, '--top', 'ir',
+                '--beta', a.beta, '--min-time', a.min_time] + ev_args + a.extra
+        if pf:
+            args += ['--prefetch'] + pf
+        _, row = run_bench(a.bench, args)
+        calls = float(row['calls'])
+        res = {'cycles': cycles(row, a.ghz)[0] / calls}
+        for c, spec in want.items():
+            if f"{spec}_min" in row:
+                res[c] = float(row[f"{spec}_min"]) / calls
+        return res
+
+    base = {k: per_call(k, []) for k in ks}
+    print(f"# in the nest (--top ir, 4 calls, in L1): k={ks[0]}: {base[ks[0]]['cycles']:.1f}, "
+          f"k={ks[1]}: {base[ks[1]]['cycles']:.1f} cycles per call")
+    c_ops = mr * nr * 8 / a.vl
+    if all('L1D_CACHE_RD' in base[k] and 'L1D_CACHE_WR' in base[k] for k in ks):
+        slope = (base[ks[1]]['L1D_CACHE_RD'] - base[ks[0]]['L1D_CACHE_RD']) / (ks[1] - ks[0])
+        ld = base[ks[0]]['L1D_CACHE_RD'] - slope * ks[0] - (c_ops if a.beta != 'zero' else 0)
+        st = sum(base[k]['L1D_CACHE_WR'] for k in ks) / 2 - c_ops
+        out.update(call_ld=ld, call_st=st, loads_per_kstep=slope)
+        vec = (mr + nr) * 8 / a.vl
+        shape = min((abs(slope - x), name) for x, name in
+                    ((vec, 'vectors'), (mr + nr * 8 / a.vl, '--bcast A'),
+                     (mr * 8 / a.vl + nr, '--bcast B'), (mr + nr, '--bcast AB')))[1]
+        print(f"  {slope:.2f} loads per k-step (closest: {shape}); per call outside the k-loop "
+              f"and the C tile: {ld:.0f} loads, {st:.0f} stores  -> --call-uops {ld:.0f}/{st:.0f}")
+    if a.prefetch:
+        key = ' '.join(sorted(a.prefetch))
+        hook = {k: per_call(k, a.prefetch) for k in ks}
+        d = {c: sum(hook[k][c] - base[k][c] for k in ks) / 2
+             for c in ('cycles', 'L1D_CACHE_RD', 'L1D_CACHE_WR') if all(c in hook[k] for k in ks)}
+        out['prefetch_hook'] = {key: {'cycles': d['cycles'], 'ld': d.get('L1D_CACHE_RD'),
+                                      'st': d.get('L1D_CACHE_WR')}}
+        print(f"  prefetch hook ({key}): {d['cycles']:.1f} cycles per call"
+              + (f", {d['L1D_CACHE_RD']:.0f} loads and {d['L1D_CACHE_WR']:.0f} stores"
+                 if 'L1D_CACHE_RD' in d else ''))
+    if ev_args:
+        os.unlink(f.name)
+    return out
+
+
 def kernel_from(calib, beta, bcast='', call_uops='0'):
     epi = EPI_FLOPS.get(beta, 3)
     mr, nr = calib['mr'], calib['nr']
-    ld, _, st = call_uops.partition('/')
+    if call_uops in ('', '0') and 'call_ld' in calib:      # calibrated
+        ld, st = str(calib['call_ld']), str(calib['call_st'])
+    else:
+        ld, _, st = call_uops.partition('/')
     return model.ukernel(mr, nr, 8, calib['peak'], epi * mr * nr / calib['epi_cycles'], epi,
                          beta != 'zero', bcast=bcast.upper(),
                          call_ld=float(ld or 0), call_st=float(st or 0))
@@ -235,6 +310,13 @@ def cmd_run(a):
         events_file.write('\n'.join(emap.values()) + '\n')
         events_file.close()
     u = kernel_from(calib, a.beta, a.bcast, a.call_uops)
+    hook = calib.get('prefetch_hook', {}).get(' '.join(sorted(a.prefetch)))
+    if hook and a.prefetch:
+        u = dataclasses.replace(u, call_extra=hook['cycles'])
+        print(f"# prefetch hook from the calibration: {hook['cycles']:.0f} cycles per call")
+    elif a.prefetch:
+        print(f"# note: no calibrated prefetch hook for {' '.join(a.prefetch)}: "
+              f"calibrate with the same --prefetch to charge its cost")
     pack = dict(kv.split(':') for kv in a.pack.split(','))
     results = []
     print(f"{'top':>4} {'size':>16} {'kc':>5} {'mc':>5} {'nc':>6}  {'measured':>9} {'model':>9} "
@@ -273,6 +355,13 @@ def cmd_run(a):
         hw = model.hw_prefetcher(a.pf_streams, a.pf_min_run, a.pf_level.upper())
         an = model.analyse(u, b, p, lv, pk, True, a.core_mshr, hw,
                            a.c_layout, sw, a.lookahead, a.sw_pf_holds_inner)
+        if hook and hook.get('ld') is not None:
+            # the hook's own loads and stores; its prefetch instructions the
+            # model already counts
+            ks_all = p.m * p.n * p.k / (u.m_r * u.n_r)
+            pf_n = sum(ev.instr_per_kstep for ev in an.evals[:len(a.prefetch)]) * ks_all / an.calls
+            an.kernel = dataclasses.replace(u, call_ld=u.call_ld + max(0.0, hook['ld'] - pf_n),
+                                            call_st=u.call_st + hook['st'])
         pred = model.predict(an)
         fm, fp = work / meas, work / pred.time
         res = {'top': top, 'm': me, 'n': ne, 'k': ke, 'kc': kc, 'mc': mc, 'nc': nc,
@@ -343,6 +432,14 @@ def main(argv=None):
         s.add_argument('--extra', nargs='*', default=[], help='more goto_bench options, e.g. --cpu 2')
     c = sub.choices['calibrate']
     c.add_argument('-o', '--output', default='calib.json')
+    c.add_argument('--prefetch', nargs='*', default=[],
+                   help="also measure goto_bench's prefetch hook with these specs: its "
+                        "cycles, loads and stores per call ('run' with the same "
+                        "--prefetch then charges them)")
+    c.add_argument('--events-map', help='events.json from probe_events.py: measure '
+                                        'loads and stores per call (--call-uops)')
+    c.add_argument('--vl', type=int, default=64, help='vector length in bytes, as run')
+    c.add_argument('--group', type=int, default=4)
     c.add_argument('--l1', type=int, help='L1 data cache bytes (default: from sysfs)')
     r = sub.choices['run']
     r.add_argument('--calib', required=True)
