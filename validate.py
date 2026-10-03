@@ -171,11 +171,13 @@ def cmd_calibrate(a):
     return 0
 
 
-def kernel_from(calib, beta, bcast=''):
+def kernel_from(calib, beta, bcast='', call_uops='0'):
     epi = EPI_FLOPS.get(beta, 3)
     mr, nr = calib['mr'], calib['nr']
+    ld, _, st = call_uops.partition('/')
     return model.ukernel(mr, nr, 8, calib['peak'], epi * mr * nr / calib['epi_cycles'], epi,
-                         beta != 'zero', bcast=bcast.upper())
+                         beta != 'zero', bcast=bcast.upper(),
+                         call_ld=float(ld or 0), call_st=float(st or 0))
 
 
 def kernel_prefetches(specs, k_c):
@@ -232,7 +234,7 @@ def cmd_run(a):
         events_file = tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False)
         events_file.write('\n'.join(emap.values()) + '\n')
         events_file.close()
-    u = kernel_from(calib, a.beta, a.bcast)
+    u = kernel_from(calib, a.beta, a.bcast, a.call_uops)
     pack = dict(kv.split(':') for kv in a.pack.split(','))
     results = []
     print(f"{'top':>4} {'size':>16} {'kc':>5} {'mc':>5} {'nc':>6}  {'measured':>9} {'model':>9} "
@@ -372,6 +374,10 @@ def main(argv=None):
     r.add_argument('--bcast', default='', metavar='OPERANDS',
                    help="operands the kernel's k-loop loads as broadcasts (A for "
                         "AOCL's 8x24 dgemm kernel), for the L1D_CACHE uop counts")
+    r.add_argument('--call-uops', default='0', metavar='LD[/ST]',
+                   help="memory uops per call outside the k-loop and the C tile, "
+                        "as model.py --call-uops (AOCL's 8x24 kernel in goto_bench "
+                        "on Zen 5: about 90/47)")
     r.add_argument('--lookahead', type=float, default=0.0, metavar='CYCLES',
                    help="cycles before the epilogue the core can issue its C loads, "
                         "as model.py --lookahead")

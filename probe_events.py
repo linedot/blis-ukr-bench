@@ -126,6 +126,19 @@ CANONICAL = {
         ('de_dispatch_stall_cycle_dynamic_tokens_part1.load_queue_rsrc_stall',
          'cycles dispatch waits for load-queue tokens')],      # AMD Zen 5
     'L1D_SW_PREFETCH_REFILL': [('ls_sw_pf_dc_fills.all', '')],  # AMD Zen
+    # who brought the lines in -- to attribute refills the model does not
+    # predict, and C lines that were in L2 before the kernel asked
+    'L1D_DEMAND_REFILL': [('ls_dmnd_fills_from_sys.all', '')],       # AMD Zen
+    'L1D_HW_PREFETCH_REFILL': [('ls_hw_pf_dc_fills.all', '')],       # AMD Zen
+    'L2_PF_DRAM_L2HW': [('l2_pf_miss_l2_l3.l2_hwpf',
+                         'L2 prefetcher requests served by DRAM')],  # AMD Zen
+    'L2_PF_DRAM_L1HW': [('l2_pf_miss_l2_l3.l1_dc_hwpf',
+                         'L1 prefetcher requests served by DRAM')],  # AMD Zen
+    'SW_PREFETCH_ISSUED': [('ls_pref_instr_disp.all',
+                            'software prefetches dispatched')],      # AMD Zen
+    'SW_PREFETCH_IN_FLIGHT': [('ls_inef_sw_pref.mab_mch_cnt',
+                               'software prefetches whose line was already '
+                               'in flight')],                        # AMD Zen
 }
 
 # Kernel generic events: the spec goto_bench takes, and perf's name for the

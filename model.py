@@ -72,7 +72,9 @@ that is paid in series with them:
               leaves L2's latency; `lookahead` is how far ahead of the
               epilogue the core can already issue the C loads.  For very
               small k_c, where the core can run the next call's whole k-loop
-              during the wait, this is pessimistic.
+              during the wait, this is pessimistic.  The later waves wait in
+              the buffers inside the limiting pool -- in the L1's, if L2's
+              is the limit -- which the predicted miss occupancy includes.
 
 PHASES.  Packing and the micro-kernel do not overlap in single-threaded BLIS,
 and pack traffic is not spread over the whole run -- it all happens inside
@@ -243,6 +245,12 @@ class ukernel:
                   broadcasts: one load per element rather than one per
                   vector.  AOCL's 8x24 dgemm kernel broadcasts A.  Only the
                   L1D_CACHE uop counts depend on it.
+    :param call_ld: Loads per call outside the k-loop and the C tile:
+                    arguments the kernel reads from memory, restored
+                    registers, the caller's bookkeeping.  Only the L1D_CACHE
+                    uop counts depend on it -- their time is already in the
+                    calibrated per-call cost.
+    :param call_st: Stores per call likewise
     """
     m_r: int
     n_r: int
@@ -254,6 +262,8 @@ class ukernel:
     c_read: bool = True
     sizes: dict[str, int] = field(default_factory=dict)
     bcast: str = ''
+    call_ld: float = 0.0
+    call_st: float = 0.0
 
     def size(self, op : str) -> int:
         """
@@ -1668,6 +1678,44 @@ def _buffer_cycles(an : analysis, phase : str='ukr'):
     return out
 
 
+def _c_burst(an : analysis) -> dict:
+    """
+    The C tile's fetch, per call, as c_exposure() sees it.
+    :return: {exposed, lines, waves, lat, queued, pool, slot}: exposed cycles
+             per call, C lines per call from beyond L1, waves, mean latency
+             per line after prefetching, lines still un-prefetched, the
+             limiting pool's holder index (-1 the core, 0 L1, ...), and how
+             long a line holds a slot of that pool
+    """
+    out = dict(exposed=0.0, lines=0.0, waves=0, lat=0.0, queued=0.0,
+               pool=None, slot=0.0)
+    bds = an.boundaries
+    c1 = bds[1].rd.get('C', 0.0) if len(bds) > 1 else 0.0
+    if c1 <= 0 or not an.calls:
+        return out
+    idx = {bd.level.name: i for i, bd in enumerate(bds)}
+    out['lines'] = n = c1 / an.calls / bds[0].level.line
+    # latency each boundary adds, for the C bytes still crossing it unhidden
+    left = {j: bds[j].rd.get('C', 0.0) * _kept(an, 'C', -1, j, idx)
+            for j in range(1, len(bds))}
+    lat = sum(v * bds[j].level.lat for j, v in left.items()) / c1
+    if lat <= 0:
+        return out
+    # the pools the burst holds: the core's queue, then the fill buffers of
+    # every level up to the deepest one it still comes from unhidden
+    deep = max(j for j, v in left.items() if v > 0)
+    pools = [(-1, an.core.mshr)] + [(i, bds[i].level.mshr) for i in range(deep)]
+    sized = [(q, h) for h, q in pools if q]
+    m, pool = min(sized) if sized else (0, None)
+    waves = max(1, math.ceil(n / m - 1e-9)) if m else 1
+    # a slot of pool h is held for the trip beyond level h
+    slot = (sum(v * bds[j].level.lat for j, v in left.items() if j > pool)
+            / c1 if pool is not None else 0.0)
+    out.update(exposed=max(0.0, waves * lat - an.lookahead), waves=waves,
+               lat=lat, queued=n * left[1] / c1, pool=pool, slot=slot)
+    return out
+
+
 def c_exposure(an : analysis) -> tuple:
     """
     Cycles per call the epilogue waits for its C tile, in series with the
@@ -1683,25 +1731,8 @@ def c_exposure(an : analysis) -> tuple:
     :return: (exposed cycles per call, C lines per call from beyond L1,
               waves, mean latency per line after prefetching)
     """
-    bds = an.boundaries
-    c1 = bds[1].rd.get('C', 0.0) if len(bds) > 1 else 0.0
-    if c1 <= 0 or not an.calls:
-        return 0.0, 0.0, 0, 0.0
-    idx = {bd.level.name: i for i, bd in enumerate(bds)}
-    # latency each boundary adds, for the C bytes still crossing it unhidden
-    left = {j: bds[j].rd.get('C', 0.0) * _kept(an, 'C', -1, j, idx)
-            for j in range(1, len(bds))}
-    lat = sum(v * bds[j].level.lat for j, v in left.items()) / c1
-    if lat <= 0:
-        return 0.0, c1 / an.calls / bds[0].level.line, 0, 0.0
-    n = c1 / an.calls / bds[0].level.line
-    # the pools the burst holds: the core's queue, then the fill buffers of
-    # every level up to the deepest one it still comes from unhidden
-    deep = max(j for j, v in left.items() if v > 0)
-    pools = [an.core.mshr] + [bds[i].level.mshr for i in range(deep)]
-    m = min((q for q in pools if q), default=0)
-    waves = max(1, math.ceil(n / m - 1e-9)) if m else 1
-    return max(0.0, waves * lat - an.lookahead), n, waves, lat
+    b = _c_burst(an)
+    return b['exposed'], b['lines'], b['waves'], b['lat']
 
 
 def phase_time(an : analysis, phase : str) -> phase_result:
@@ -2345,8 +2376,13 @@ def counters(an : analysis, vl : int=64) -> pmu_prediction:
     per_k = sum(n if op in u.bcast else n * s / vl
                 for op, n, s in (('A', u.m_r, sa), ('B', u.n_r, sb)))
     uops_ld = an.calls * (an.nest.k_mean * per_k
-                          + (u.m_r * u.n_r * sc / vl if u.c_read else 0))
-    uops_st = an.calls * u.m_r * u.n_r * sc / vl
+                          + (u.m_r * u.n_r * sc / vl if u.c_read else 0)
+                          + u.call_ld)
+    uops_st = an.calls * (u.m_r * u.n_r * sc / vl + u.call_st)
+    # prefetch instructions are dispatched as loads (they are on AMD; on Arm
+    # whether L1D_CACHE counts PRFM is implementation-defined)
+    ks_all = p.m * p.n * p.k / (u.m_r * u.n_r)
+    uops_ld += sum(ev.instr_per_kstep for ev in an.evals) * ks_all
     w = an.pack_elems
     uops_pack = (w['A'] * sa + w['B'] * sb) * 2 / vl    # read once, written once
 
@@ -2384,6 +2420,20 @@ def counters(an : analysis, vl : int=64) -> pmu_prediction:
             if name != 'core' and _core_cache(name):
                 key = f'{name}D_MISS_OCCUPANCY'
                 ev[key] = ev.get(key, 0.0) + rnum
+    # an un-prefetched C tile arrives as a burst: the levels inside its
+    # limiting pool hold every line from the start, so a line of wave w also
+    # waits w slot-times there before its trip -- queueing that the trip
+    # latencies above leave out
+    cb = _c_burst(an)
+    if cb['queued'] and cb['pool'] is not None and cb['pool'] > 0:
+        m = cb['queued'] / cb['waves'] if cb['waves'] else cb['queued']
+        k = math.ceil(cb['queued'] - 1e-9)
+        wait = sum(int(i // m) for i in range(k)) * cb['slot'] if m else 0.0
+        for i in range(cb['pool']):
+            name = bds[i].level.name
+            if _core_cache(name):
+                key = f'{name}D_MISS_OCCUPANCY'
+                ev[key] = ev.get(key, 0.0) + an.calls * wait
     ksteps = p.m * p.n * p.k / (u.m_r * u.n_r)
     return pmu_prediction(ev, ksteps, an.calls, pred)
 
@@ -2951,6 +3001,17 @@ def selftest() -> int:
     to_l1 = analyse(u, b, p, lv, free, sw=[parse_prefetch('ir:C:L1')])
     chk("prefetched into L1: nothing exposed", c_exposure(to_l1)[0], 0)
 
+    print("\na burst's later waves wait in the buffers inside the limit")
+    ev = counters(an).events          # L2 has 4 buffers: 8 lines, 2 waves
+    base = sum(r for nm, _, r, _ in _buffer_cycles(an, 'ukr') if nm == 'L1') \
+        + sum(r for nm, _, r, _ in _buffer_cycles(an, 'pack') if nm == 'L1')
+    chk("L1 occupancy += calls * 4 lines * one MEM slot (150)",
+        ev['L1D_MISS_OCCUPANCY'] - base, an.calls * 4 * 150)
+    chk("... and none once C is prefetched into L1",
+        counters(to_l1).events['L1D_MISS_OCCUPANCY'] - sum(
+            r for ph in ('ukr', 'pack')
+            for nm, _, r, _ in _buffer_cycles(to_l1, ph) if nm == 'L1'), 0)
+
     print("\na streamer is charged what one iteration of the loop touches")
     bs = blocking(8, 256, 1024)
     jr = [r for r in make_goto_ladder(u, bs, p) if r.loop == 'jr'][0]
@@ -2965,6 +3026,19 @@ def selftest() -> int:
     rd = counters(ab, 64).events['L1D_CACHE_RD']
     chk("8x24, A broadcast: 8 + 3 loads per k-step, 24 per C tile",
         (rd - ab.calls * 24) / (ab.calls * 64), 11)
+    uc = replace(ub, call_ld=90.0, call_st=47.0)
+    ac = analyse(uc, blocking(64, 96, 240), pq, parse_hierarchy('INF:::-1'), outside)
+    evc = counters(ac, 64).events
+    chk("per-call uops: + 90 loads per call",
+        (evc['L1D_CACHE_RD'] - rd) / ac.calls, 90)
+    chk("... and + 47 stores per call",
+        (evc['L1D_CACHE_WR'] - counters(ab, 64).events['L1D_CACHE_WR']) / ac.calls, 47)
+    apf = analyse(ub, blocking(64, 96, 240), pq, parse_hierarchy('64K:64::-1::16:5;INF:::-1:::150'),
+                  outside, sw=[parse_prefetch('ir:C:L1')])
+    rd_pf = counters(apf, 64).events['L1D_CACHE_RD']
+    rd_no = counters(_rerun(apf, []), 64).events['L1D_CACHE_RD']
+    chk("ir:C:L1 adds one prefetch per C line: 24 per call",
+        (rd_pf - rd_no) / apf.calls, 24)
 
     print("\nmiss occupancy chains the latencies: a mean L1 miss pays the L2")
     print("latency, plus the memory latency for the share that misses L2 too")
@@ -3051,6 +3125,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="operands the k-loop loads as broadcasts, one load per "
                          "element: A for AOCL's 8x24 dgemm kernel.  Only the "
                          "L1D_CACHE uop counts depend on it.")
+    ap.add_argument('--call-uops', default='0', metavar='LD[/ST]',
+                    help="memory uops per call outside the k-loop and the C "
+                         "tile: arguments read from memory, saved registers, "
+                         "the caller's bookkeeping.  Only the L1D_CACHE uop "
+                         "counts depend on it.")
     ap.add_argument('--lookahead', type=float, default=0.0, metavar='CYCLES',
                     help="cycles before the epilogue the core can already issue "
                          "its C loads.  An un-prefetched C tile is fetched in "
@@ -3125,7 +3204,9 @@ def _make_kernel(ap : argparse.ArgumentParser,
         ap.error(f"--s: {e}")
     epi = {'general': 3, 'one': 2, 'zero': 1}[a.beta]
     return ukernel(a.mr, a.nr, sizes['A'], a.peak, a.epi_peak, epi,
-                   c_read=a.beta != 'zero', sizes=sizes, bcast=a.bcast.upper())
+                   c_read=a.beta != 'zero', sizes=sizes, bcast=a.bcast.upper(),
+                   call_ld=float(a.call_uops.split('/')[0]),
+                   call_st=float((a.call_uops.split('/') + ['0'])[1]))
 
 
 def main(argv : list[str]=None) -> int:

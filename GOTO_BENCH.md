@@ -86,8 +86,11 @@ What each ISA can prefetch
 The header prints what each requested prefetch became on this build.
 
 * AArch64: `PRFM {PLD,PST}{L1,L2,L3}{KEEP,STRM}` -- every combination.
-* x86-64: `prefetcht0/t1/t2` choose L1/L2/L3; `strm` is `prefetchnta` and
-  write intent is `prefetchw`, both without level control.
+* x86-64: `prefetcht0/t1/t2` choose L1/L2/L3 -- on Zen 5, t1 fills every
+  level but L1 and t2 every level but L1 and L2; `strm` is `prefetchnta`.
+  Write intent is `prefetchw`, which fills L1 only, so a write prefetch aimed
+  at L2 or L3 (`ir:C:L2`) becomes `prefetcht1`/`t2`: the level is kept, the
+  hint dropped.
 * RISC-V: Zicbop `prefetch.r/.w`, with a Zihintntl hint in front for the
   level: `ntl.p1` for L2 (skips the innermost private level), `ntl.pall` for
   L3 (skips every private level, so it lands in the innermost shared one --
@@ -120,7 +123,10 @@ level is last here (from sysfs: L2 on K1, L3 on Zen 5).
 Besides the model's events (L1D/L2D accesses, refills and write-backs, the
 `_RD`/`_WR` splits, and `L1D_MISS_OCCUPANCY`) it maps a few the model does not
 predict but that explain a run: `STALL_BACKEND`, `STALL_BACKEND_MEM`,
-`LOAD_QUEUE_STALL`, `L1D_SW_PREFETCH_REFILL`.
+`LOAD_QUEUE_STALL`, and -- to attribute refills -- L1 fills by demand,
+hardware prefetch and software prefetch, the L1 and L2 prefetchers' requests
+served by DRAM, and software prefetches dispatched or finding their line
+already in flight.
 
 Where events are missing it says why: on AMD, an unloaded amd-uncore module;
 on RISC-V, a core whose mvendorid-marchid-mimpid perf's mapfile lacks, so only
@@ -173,6 +179,11 @@ others as measured only. `--vl` sets the vector length the model's
 RVV, 16 for NEON), and `--bcast` the operands the k-loop loads element by
 element: AOCL's 8x24 dgemm kernel broadcasts the 8 values of A and loads B as
 three vectors, 11 loads per k-step where vectors throughout would be 4.
+`--call-uops LD/ST` adds the memory operations each call makes outside the
+k-loop and the C tile -- the kernel reading its arguments from memory, saved
+registers, the harness's bookkeeping; about 90/47 for AOCL's kernel in
+goto_bench on Zen 5, read off as the intercept of a k_c sweep. Prefetch
+instructions, the kernel's and the harness's, count as reads.
 
 The model sees only the prefetches goto_bench issues, unless told more:
 `--kernel-prefetch` takes prefetches inside the micro-kernel, in model.py's
@@ -186,7 +197,9 @@ Below that it prefetches nothing, so its C fetch is exposed every call.
 The model charges that exposed fetch in series with the k-loop: the C tile's
 lines from beyond L1, in waves through the tightest buffer pool on their way,
 times the latency left after any prefetch, less `--lookahead` (how far ahead
-of the epilogue the core issues the C loads; default 0). With a memory-bound
+of the epilogue the core issues the C loads; default 0). Later waves wait in
+the buffers inside that pool -- in L1's MABs, if L2's buffers are the limit --
+and the predicted `L1D_MISS_OCCUPANCY` includes that wait. With a memory-bound
 C, this term usually binds, and its two unknowns separate on the counters: the
 mean L1 miss latency (`L1D_MISS_OCCUPANCY / L1D_CACHE_REFILL`) gives the
 latency, and the time per call then gives the waves, i.e. the buffer count.
