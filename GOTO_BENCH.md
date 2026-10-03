@@ -171,7 +171,24 @@ counters mapped by `--events-map`: the model's events with their ratio, the
 others as measured only. `--vl` sets the vector length the model's
 `L1D_CACHE` uop counts assume (64 B for SME or AVX-512, 32 for AVX2 or 256-bit
 RVV, 16 for NEON); they also assume both panels are loaded as vectors, so for a
-kernel that broadcasts B element by element, `L1D_CACHE` undercounts. Runs with a packing placement other than
+kernel that broadcasts B element by element, `L1D_CACHE` undercounts.
+
+The model sees only the prefetches goto_bench issues, unless told more:
+`--kernel-prefetch` takes prefetches inside the micro-kernel, in model.py's
+syntax with the lead in k-steps (AOCL's 8x24 dgemm kernel prefetches its C
+tile 32 k-steps before the update: `ir:C:L1:keep:32`), and `--pf-streams`,
+`--pf-min-run`, `--pf-level` describe the hardware prefetcher as in model.py.
+
+A block that is not a multiple of the register block wastes compute: the
+micro-kernel always computes a whole m_r x n_r tile, so with m_c = 4 and
+m_r = 8 every call is half empty, and the model charges it as a whole call.
+For experiments that should stress memory rather than edge handling, keep
+m_c a multiple of m_r -- m_c = m_r is the least reuse of B without waste.
+
+Pick configurations by what they can test: a sweep the model predicts to be
+compute-bound everywhere checks the peak and per-call cost, not the memory
+parameters. Small k_c with C streaming from memory is where the miss buffers
+and latencies bind; run the model first and look at its `model bound`. Runs with a packing placement other than
 BLIS's are flagged: the model's in-place repacking rule assumes it.
 
 The bandwidths, latencies and buffer counts in `--cache` are not in sysfs and

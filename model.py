@@ -467,14 +467,14 @@ class loop_nest:
     @property
     def m_mean(self) -> float:
         """
-        :return: mean m block -- ir trips per ic block are m_mean / m_r
+        :return: mean m block (ir trips per ic block: see tiles())
         """
         return self.sizes.m / self.n_ic
 
     @property
     def n_mean(self) -> float:
         """
-        :return: mean n block -- jr trips per jc block are n_mean / n_r
+        :return: mean n block (jr trips per jc block: see tiles())
         """
         return self.sizes.n / self.n_jc
 
@@ -915,6 +915,33 @@ def coverage(shape : list[stream], pf : hw_prefetcher) -> dict[str,float]:
 
 # ----------------------------------------------------------------- model ---
 
+def tiles(t : loop_nest, m_r : int, n_r : int) -> tuple:
+    """
+    Micro-tiles over the whole problem, along m and along n.  The micro-kernel
+    always computes a whole m_r x n_r tile, so a block that is not a multiple
+    of the register block rounds up, block by block -- with m_c = 4 and
+    m_r = 8 every call is half wasted.  Counting dim / m_r instead charges a
+    partial tile as a fraction of a call.
+    :param t: the loop nest
+    :param m_r: register block rows
+    :param n_r: register block columns
+    :return: (tiles along m, tiles along n)
+    """
+    def along(dim, blk, trips, r):
+        last = dim - (trips - 1) * blk
+        return (trips - 1) * -(-blk // r) + -(-last // r)
+    return (along(t.sizes.m, t.m_c, t.n_ic, m_r),
+            along(t.sizes.n, t.n_c, t.n_jc, n_r))
+
+
+def micro_calls(u : 'ukernel', t : loop_nest) -> int:
+    """
+    :return: micro-kernel calls over the whole problem, whole tiles each
+    """
+    tm, tn = tiles(t, u.m_r, u.n_r)
+    return tm * tn * t.n_pc
+
+
 def make_loop_nest(b : blocking, p : problem) -> loop_nest:
     """
     Clamp each block to its dimension and count whole trips.
@@ -939,6 +966,7 @@ def make_goto_ladder(u : ukernel, b : blocking, p : problem) -> list[goto_rung]:
     :return: list of goto_rung objects for each loop
     """
     t = make_loop_nest(b, p)
+    tm, tn = tiles(t, u.m_r, u.n_r)
     sa, sb, sc = u.size('A'), u.size('B'), u.size('C')
     A_r = t.k_c * u.m_r * sa
     B_r = t.k_c * u.n_r * sb
@@ -948,8 +976,9 @@ def make_goto_ladder(u : ukernel, b : blocking, p : problem) -> list[goto_rung]:
     C_p = p.m * t.n_c * sc
     A_f = p.m * p.k * sa
     return [
-        goto_rung('ir', 'B', B_r, {'A': A_r, 'C': C_r}, t.m_mean / u.m_r),
-        goto_rung('jr', 'A', A_c, {'B': B_r, 'C': C_r}, t.n_mean / u.n_r),
+        # calls per ir loop and jr iterations per jc block, whole tiles
+        goto_rung('ir', 'B', B_r, {'A': A_r, 'C': C_r}, tm / t.n_ic),
+        goto_rung('jr', 'A', A_c, {'B': B_r, 'C': C_r}, tn / t.n_jc),
         goto_rung('ic', 'B', B_c, {'A': A_c, 'C': C_r}, t.n_ic),
         goto_rung('pc', 'C', C_p, {'A': A_c, 'B': B_c}, t.n_pc),
         goto_rung('jc', 'A', A_f, {'B': B_c, 'C': C_p}, t.n_jc),
@@ -1003,14 +1032,17 @@ def core_traffic(u : ukernel, b : blocking, p : problem,
     :return: bytes moved over the whole GEMM, before any reuse
     """
     t = make_loop_nest(b, p)
-    calls = (p.m / u.m_r) * (p.n / u.n_r) * t.n_pc
+    calls = micro_calls(u, t)
+    # every call streams whole packed micro-panels; C moves only where it is
+    # real -- a partial tile is computed whole but written back in part
+    c_elems = p.m * p.n * t.n_pc
     w = packed_elems(u, b, p, pk)
     rd = {
         'A': calls * t.k_mean * u.m_r * u.size('A'),
         'B': calls * t.k_mean * u.n_r * u.size('B'),
-        'C': calls * u.m_r * u.n_r * u.size('C') if u.c_read else 0.0,
+        'C': c_elems * u.size('C') if u.c_read else 0.0,
     }
-    wr = {'C': calls * u.m_r * u.n_r * u.size('C')}
+    wr = {'C': c_elems * u.size('C')}
     pack_rd = {'A': w['A'] * u.size('A') * pk.amp_a,
                'B': w['B'] * u.size('B') * pk.amp_b}
     pack_wr = {'A': w['A'] * u.size('A'), 'B': w['B'] * u.size('B')}
@@ -1069,9 +1101,10 @@ def loop_period(an : analysis, loop : str) -> float:
     :return: cycles per iteration
     """
     u, t = an.kernel, an.nest
+    tm, tn = tiles(t, u.m_r, u.n_r)
     t_call = u.time(t.k_mean)
-    t_jr = (t.m_mean / u.m_r) * t_call
-    t_ic = (t.n_mean / u.n_r) * t_jr
+    t_jr = (tm / t.n_ic) * t_call
+    t_ic = (tn / t.n_jc) * t_jr
     t_pc = t.n_ic * t_ic
     return {'k': 2 * u.m_r * u.n_r / u.peak, 'ir': t_call, 'jr': t_jr,
             'ic': t_ic, 'pc': t_pc, 'jc': t.n_pc * t_pc}[loop]
@@ -1463,7 +1496,7 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
 
     t = make_loop_nest(b, p)
     flops = 2 * p.m * p.n * p.k + u.epi_flops * p.m * p.n * t.n_pc
-    calls = (p.m / u.m_r) * (p.n / u.n_r) * t.n_pc
+    calls = micro_calls(u, t)
     w = packed_elems(u, b, p, pk)
     t_ukr = calls * u.time(t.k_mean)
     t_pack = ((w['A'] / pk.rate_a if pk.rate_a else 0.0)
@@ -2793,6 +2826,19 @@ def selftest() -> int:
         a_out.boundaries[1].ukr_rd, a_in.boundaries[1].ukr_rd)
     chk("only A outside: B's packing remains",
         a_a.pack_elems['B'], a_in.pack_elems['B'])
+
+    print("\na partial tile costs a whole call: the kernel computes all of it")
+    u8 = ukernel(8, 8, 8, 16.0, 16.0, 3, True)
+    lv = parse_hierarchy('INF:::-1')
+    pq = problem(64, 64, 64)
+    half = analyse(u8, blocking(64, 4, 64), pq, lv, free)
+    full = analyse(u8, blocking(64, 8, 64), pq, lv, free)
+    chk("m_c = m_r/2: twice the calls of m_c = m_r", half.calls, 2 * full.calls)
+    chk("... twice the micro-kernel time", half.t_ukr, 2 * full.t_ukr)
+    chk("... but C moves only where it is real", half.boundaries[0].ukr_wr,
+        pq.m * pq.n * u8.size('C'))
+    edge = analyse(u8, blocking(64, 64, 20), problem(64, 20, 64), lv, free)
+    chk("n = 20, n_r = 8: 3 column tiles, not 2.5", edge.calls, 8 * 3)
 
     print("\nmiss occupancy chains the latencies: a mean L1 miss pays the L2")
     print("latency, plus the memory latency for the share that misses L2 too")

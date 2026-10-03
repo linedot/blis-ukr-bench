@@ -254,7 +254,9 @@ def cmd_run(a):
         p = model.problem(me, ne, ke)
         kc_mean = ke / math.ceil(ke / kc)
         sw = [to_model_prefetch(s, lv, u, kc_mean) for s in a.prefetch]
-        an = model.analyse(u, b, p, lv, pk, True, a.core_mshr, model.hw_prefetcher(),
+        sw += [model.parse_prefetch(s) for s in a.kernel_prefetch]
+        hw = model.hw_prefetcher(a.pf_streams, a.pf_min_run, a.pf_level.upper())
+        an = model.analyse(u, b, p, lv, pk, True, a.core_mshr, hw,
                            a.c_layout, sw)
         pred = model.predict(an)
         fm, fp = work / meas, work / pred.time
@@ -339,7 +341,19 @@ def main(argv=None):
     r.add_argument('--top', nargs='+', default=['jc'], choices=RUNGS[:6])
     r.add_argument('--pack', default='A:ic,B:pc')
     r.add_argument('--c-layout', default='rm', choices=['rm', 'cm'])
-    r.add_argument('--prefetch', nargs='*', default=[])
+    r.add_argument('--prefetch', nargs='*', default=[],
+                   help="prefetches goto_bench issues between calls (and the model gets)")
+    r.add_argument('--kernel-prefetch', nargs='*', default=[], metavar='PF',
+                   help="prefetches inside the micro-kernel, for the model only, in "
+                        "model.py's syntax (lead in k-steps), e.g. ir:C:L1:keep:32 "
+                        "for AOCL's 8x24 dgemm kernel, which prefetches C 32 k-steps "
+                        "before its update")
+    r.add_argument('--pf-streams', type=int, default=0,
+                   help="hardware prefetcher streams, as model.py (0: not modelled)")
+    r.add_argument('--pf-min-run', type=int, default=4,
+                   help="lines before the hardware prefetcher detects a stream")
+    r.add_argument('--pf-level', default='',
+                   help="level the hardware prefetcher fills, e.g. L1 or L2")
     r.add_argument('--core-mshr', type=int, default=0)
     r.add_argument('--vl', type=int, default=64,
                    help="vector length in bytes, for the model's L1D_CACHE uop counts: "
