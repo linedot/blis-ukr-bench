@@ -175,7 +175,10 @@ validate.py run --bench build/goto_bench --calib calib.json \
 `calibrate` fits the micro-kernel at k small enough to stay in L1 as
 t(k) = C + b*k, giving `--peak` (2*mr*nr/b) and the per-call cost C, which the
 model charges as its epilogue -- leaving out k < 8, where the per-call work
-overlaps the short k-loop differently; then times one A_c and one B_c pack in
+overlaps the short k-loop differently, and any point more than 2% off the
+line while three remain (a fitted peak above the hardware's is the sign of
+one). `--peak` fixes the slope when the peak is known, so that only C is
+fitted; then times one A_c and one B_c pack in
 cache for `--pack-rate`. It also times one `ir` loop in L1 at two k. With
 `--events-map`, the intercepts of loads and stores per call against k, less
 the C tile's, become the default `--call-uops`, and the slope is printed as
@@ -211,7 +214,9 @@ The model sees only the prefetches goto_bench issues, unless told more:
 `--kernel-prefetch` takes prefetches inside the micro-kernel, in model.py's
 syntax with the lead in k-steps, and `--pf-streams`, `--pf-min-run`,
 `--pf-level` describe the hardware prefetcher as in model.py. A kernel may
-prefetch only above some k_c; end the spec in `@KMIN` for that. AOCL's 8x24
+prefetch only above some k_c; end the spec in `@KMIN` for that. A lead of `k`
+means the whole k-loop: a prefetch issued at the call's start, as BLIS's
+armv8a 8x6 dgemm kernel does for its C rows (`ir:C:L1:keep:k`). AOCL's 8x24
 dgemm kernel prefetches its C tile only once k/4 exceeds its 24-iteration
 tail, i.e. for k_c >= 128, then 100-128 k-steps ahead: `ir:C:L1:keep:100@128`.
 Below that it prefetches nothing, so its C fetch is exposed every call.
@@ -228,9 +233,20 @@ latency, and the time per call then gives the waves, i.e. the buffer count.
 
 Whether a software prefetch into an outer level also holds the inner levels'
 fill buffers until it lands is implementation-dependent. The model assumes it
-does not; `--sw-pf-holds-inner` says it does. On Zen 5, `PREFETCHT1` (what
-`ir:C:L2` issues) does: with it, measured L1 miss occupancy matches the model
-only with the switch set. It changes occupancy, not the epilogue's wait.
+does not; `--sw-pf-holds-inner` says it does. It changes occupancy, not the
+epilogue's wait. On Zen 5 with `ir:C:L2`, L1 miss occupancy matches only with
+it set -- but not because `PREFETCHT1` holds L1 buffers: it fills nothing in
+L1 (`L1D_SW_PREFETCH_REFILL` is 0), and most find their line already in
+flight. The L1 hardware prefetcher fetches C into L1 -- its stride
+prefetcher follows C's rows from call to call -- and so C's whole trip is in
+L1's buffers anyway, which the switch happens to charge.
+
+Levels outside the core's clock domain, main memory above all, are fixed in
+time, so their cycles move with the clock. Give their latency in ns and their
+bandwidth in GB/s (`INF:::60G/30G:::55ns`): `run` converts them at each run's
+own clock -- cycles over time, shown in the GHz column -- and `model.py` at
+`--ghz`. The calibration runs in L1, in core cycles, so the clock does not
+move it; a sibling hyperthread busy on the same core does.
 
 The residency test charges each streamer what one iteration of the loop
 touches: for `jr` the whole C strip (m_c x n_r), for `ic` the whole C block

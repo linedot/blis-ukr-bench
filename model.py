@@ -59,9 +59,8 @@ that is paid in series with them:
               ones without allocating, which is why it can relieve them.
               That is implementation-dependent -- if the core tracks such a
               prefetch in an inner fill buffer until it lands, the relief is
-              not there (--sw-pf-holds-inner: Zen 5's PREFETCHT1, by its L1
-              miss-occupancy counter).  The epilogue's wait is relieved
-              either way: the line is in the outer level in time.
+              not there (--sw-pf-holds-inner).  The epilogue's wait is
+              relieved either way: the line is in the outer level in time.
 
               These are average-rate bounds.  A burst -- the C tile, all
               requested at the epilogue -- needs all its slots at once, so it
@@ -1869,7 +1868,27 @@ def _pair(tok : str, cast : type=float, unknown_neg : bool=True) -> tuple:
     return v, v, True
 
 
-def parse_hierarchy(spec : str | list[str]) -> list[cache_level]:
+def _clock_fields(ent : str) -> tuple:
+    """An entry's rd[/wr] and latency fields, for unit checks"""
+    f = [x.strip() for x in ent.split(':')] + [''] * 7
+    return f[3], f[6]
+
+
+def has_clock_units(spec) -> bool:
+    """
+    Whether a --cache spec gives a latency in ns or a bandwidth in GB/s:
+    then it needs the core clock, which may differ from run to run.
+    """
+    entries = spec if isinstance(spec, list) else spec.replace(',', ';').split(';')
+    for ent in entries:
+        bw, lat = _clock_fields(ent)
+        if lat.lower().endswith('ns') or any(t.strip().upper().endswith('G')
+                                             for t in bw.split('/') if t.strip()):
+            return True
+    return False
+
+
+def parse_hierarchy(spec : str | list[str], ghz : float=None) -> list[cache_level]:
     """
     Parse a hierarchy, innermost level first.
 
@@ -1892,7 +1911,15 @@ def parse_hierarchy(spec : str | list[str]) -> list[cache_level]:
     memory: its capacity is never consulted for residency, it only terminates
     the chain and supplies a bandwidth and a latency.
 
+    Bandwidth is in bytes per core cycle and latency in core cycles, unless
+    written with a unit -- 60G for GB/s, 55ns -- for levels outside the core's
+    clock domain, DRAM above all: those are fixed in time, so their cycles
+    move with the clock.  They are converted at ghz.
+
+        INF:::60G/30G:::55ns          main memory, in time units
+
     :param spec: a list of entries, one ';'-separated string, or a preset name
+    :param ghz: the core clock, for fields given in ns or GB/s
     :return: the levels, in the order given
     """
     if isinstance(spec, str):
@@ -1901,7 +1928,7 @@ def parse_hierarchy(spec : str | list[str]) -> list[cache_level]:
                    .replace(',', ';').split(';') if e.strip()]
     else:
         if len(spec) == 1 and spec[0].strip().lower() in PRESETS:
-            return parse_hierarchy(spec[0])
+            return parse_hierarchy(spec[0], ghz)
         entries = [e for e in spec if e.strip()]
 
     levels, nfin = [], 0
@@ -1913,6 +1940,12 @@ def parse_hierarchy(spec : str | list[str]) -> list[cache_level]:
         size = parse_size(f[0])
         line = int(f[1]) if f[1] else 64
         assoc = int(f[2]) if f[2] else 0
+        if has_clock_units([ent]) and not ghz:
+            raise ValueError(f"entry {ent!r} is in ns or GB/s: give the core clock (--ghz)")
+        f[3] = '/'.join(str(float(t.strip()[:-1]) / ghz) if t.strip().upper().endswith('G')
+                        else t for t in f[3].split('/')) if f[3] else f[3]
+        if f[6].lower().endswith('ns'):
+            f[6] = str(float(f[6][:-2]) * ghz)
         rbw, wbw, shared_bw = _pair(f[3])
         usable = float(f[4]) if f[4] else 1.0
         mshr, wbuf, shared_buf = _pair(f[5], cast=int, unknown_neg=False)
@@ -3018,6 +3051,16 @@ def selftest() -> int:
     edge = analyse(u8, blocking(64, 64, 20), problem(64, 20, 64), lv, free)
     chk("n = 20, n_r = 8: 3 column tiles, not 2.5", edge.calls, 8 * 3)
 
+    print("\nlevels outside the core clock: ns and GB/s convert at the clock")
+    mem = parse_hierarchy('INF:::60G/30G:::55ns', ghz=5.0)[0]
+    chk("60 GB/s at 5 GHz: 12 bytes per cycle", mem.rbw, 12.0)
+    chk("55 ns at 5 GHz: 275 cycles", mem.lat, 275.0)
+    try:
+        parse_hierarchy('INF:::60G:::55ns')
+        chk("... and refused without a clock", 0.0, 1.0)
+    except ValueError:
+        chk("... and refused without a clock", 1.0, 1.0)
+
     print("\nan un-prefetched C tile is fetched in series with the k-loop")
     lv = parse_hierarchy('32K:64::-1::16:5;1M:64::-1::4:18;INF:::-1:::150')
     an = analyse(u, b, p, lv, free)
@@ -3159,6 +3202,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--kc', type=int, default=256)
     ap.add_argument('--mc', type=int, default=256)
     ap.add_argument('--nc', type=int, default=1024)
+    ap.add_argument('--ghz', type=float,
+                    help="the core clock, for --cache fields given in ns or GB/s")
     ap.add_argument('--size', type=int, nargs=3, default=[2048, 2048, 2048],
                     metavar=('M', 'N', 'K'))
     ap.add_argument('--mem-bw', type=float, default=None,
@@ -3179,8 +3224,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="a software prefetch into an outer level is tracked in "
                          "the inner levels' fill buffers until it lands, so it "
                          "relieves the core's queue and the epilogue's wait but "
-                         "not those buffers.  Zen 5's PREFETCHT1 behaves so by "
-                         "its L1 miss-occupancy counter.")
+                         "not those buffers.  On Zen 5 it matches the L1 miss "
+                         "occupancy -- because the L1 hardware prefetcher fetches "
+                         "C into L1, not because PREFETCHT1 holds L1 buffers")
     ap.add_argument('--call-extra', type=float, default=0.0, metavar='CYCLES',
                     help="cycles per call the caller spends between calls (a "
                          "prefetch hook); they overlap with the epilogue's wait "
@@ -3235,7 +3281,7 @@ def _make_levels(ap : argparse.ArgumentParser,
     :return: the levels, innermost first
     """
     try:
-        lv = parse_hierarchy(a.cache)
+        lv = parse_hierarchy(a.cache, a.ghz)
     except ValueError as e:
         ap.error(f"--cache: {e}")
     if a.level_names:

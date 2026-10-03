@@ -75,7 +75,8 @@ CANONICAL = {
         ('generic:L1D_WRITE_ACCESS', '')],
     # lines brought into L1D, prefetched ones included
     'L1D_CACHE_REFILL': [
-        ('l1d_cache_refill', ''),                              # Arm 0x03
+        ('l1d_cache_refill', 'whether refills by prefetch instructions count is '
+                             'implementation-defined; TSV110 does not count them'),
         ('l1d.replacement', ''),                               # Intel
         ('ls_any_fills_from_sys.all', ''),                     # AMD Zen 4/5
         ('ls_refills_from_sys.all', ''),                       # AMD Zen 2/3

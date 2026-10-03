@@ -133,7 +133,8 @@ def cmd_calibrate(a):
     mr, nr = (int(x) for x in meta['ukr size'].split()[0].split('x'))
     l1 = a.l1 or next((sz for lv, sz, _, _ in sysfs_caches() if lv == 1), 32 * 1024)
     kmax = max(8, (l1 // 2 - 8 * mr * nr) // (8 * (mr + nr)))
-    ks = sorted({max(4, int(kmax * f) // 4 * 4) for f in (1 / 16, 1 / 8, 1 / 4, 1 / 2, 1)})
+    ks = sorted({max(4, int(kmax * f) // 4 * 4)
+                 for f in (1 / 16, 1 / 8, 3 / 16, 1 / 4, 3 / 8, 1 / 2, 3 / 4, 1)})
     print(f"# micro-kernel {mr}x{nr} ({meta.get('ukr implementation', '?')}), "
           f"k up to {kmax} keeps it in L1 ({model._fmt_size(l1)})")
     pts, src = [], ''
@@ -145,20 +146,41 @@ def cmd_calibrate(a):
         pts.append((k, cyc))
         print(f"  k={k:>5}: {cyc:9.1f} cycles per call")
     # the smallest k overlaps the per-call work with its short k-loop
-    # differently, which bends the line: fit k >= 8 when that leaves three
+    # differently, which bends the line: fit k >= 8 when that leaves three.
+    # One bad point bends it too -- a peak above the hardware's is the sign
+    # -- so the worst is dropped while it misses the line by over 2%
     fit = [(k, c) for k, c in pts if k >= 8]
     if len(fit) < 3:
         fit = pts
-    elif len(fit) < len(pts):
-        print(f"  (fit leaves out k < 8: {[k for k, _ in pts if k < 8]})")
-    n = len(fit)
-    mk, mc = sum(k for k, _ in fit) / n, sum(c for _, c in fit) / n
-    b = (sum((k - mk) * (c - mc) for k, c in fit) / sum((k - mk) ** 2 for k, _ in fit))
-    c0 = mc - b * mk
-    worst = max(abs(c0 + b * k - c) / c for k, c in fit)
+
+    def line(points):
+        n = len(points)
+        mk, mc = sum(k for k, _ in points) / n, sum(c for _, c in points) / n
+        if a.peak:                               # slope given: median intercept
+            b = 2 * mr * nr / a.peak
+            c0 = sorted(c - b * k for k, c in points)[n // 2]
+        else:
+            b = (sum((k - mk) * (c - mc) for k, c in points)
+                 / sum((k - mk) ** 2 for k, _ in points))
+            c0 = mc - b * mk
+        res = {k: abs(c0 + b * k - c) / c for k, c in points}
+        return b, c0, res
+
+    b, c0, res = line(fit)
+    while len(fit) > 3 and max(res.values()) > 0.02:
+        bad = max(res, key=res.get)
+        print(f"  (left out k={bad}: {100 * res[bad]:.1f}% off the line)")
+        fit = [p for p in fit if p[0] != bad]
+        b, c0, res = line(fit)
+    worst = max(res.values())
     peak = 2 * mr * nr / b
-    print(f"  fit t(k) = {c0:.1f} + {b:.3f}*k   (worst residual {100 * worst:.1f}%)")
-    print(f"  -> peak {peak:.2f} FLOP/cycle, {c0:.1f} cycles per call outside the k-loop")
+    print(f"  fit t(k) = {c0:.1f} + {b:.3f}*k over k = {[k for k, _ in fit]}"
+          f"   (worst residual {100 * worst:.1f}%)")
+    print(f"  -> peak {peak:.2f} FLOP/cycle" + (" (given)" if a.peak else "")
+          + f", {c0:.1f} cycles per call outside the k-loop")
+    if worst > 0.02:
+        print("  # warning: the points do not lie on a line -- rerun with a longer "
+              "--min-time, or give --peak")
 
     rates = {}
     for op, top, size, blk in (('A', 'packA', (8 * mr, 64, 256), (256, 8 * mr, 64)),
@@ -265,8 +287,12 @@ def kernel_prefetches(specs, k_c):
     out = []
     for s in specs:
         spec, _, kmin = s.partition('@')
-        if not kmin or k_c >= int(kmin):
-            out.append(model.parse_prefetch(spec))
+        if kmin and k_c < int(kmin):
+            continue
+        f = spec.split(':')
+        if len(f) > 4 and f[4] in ('k', 'kc'):    # from the start of the call
+            f[4] = str(k_c)
+        out.append(model.parse_prefetch(':'.join(f)))
     return out
 
 
@@ -300,10 +326,15 @@ def cmd_run(a):
     if calib.get('beta') != a.beta:
         print(f"# warning: calibrated with --beta {calib.get('beta')}, running with {a.beta}; "
               f"the per-call cost may differ")
-    levels = model.parse_hierarchy(a.cache)
-    if a.level_names:
-        levels = model.name_levels(levels, a.level_names.split(','))
-    levels = sorted(levels, key=lambda L: L.size)
+    def levels_at(ghz):
+        lv = model.parse_hierarchy(a.cache, ghz)
+        if a.level_names:
+            lv = model.name_levels(lv, a.level_names.split(','))
+        return sorted(lv, key=lambda L: L.size)
+
+    # a spec with ns or GB/s fields is re-read at each run's own clock
+    clocked = model.has_clock_units(a.cache)
+    levels = None if clocked else levels_at(a.ghz)
     emap, events_file = {}, None
     if a.events_map:
         with open(a.events_map) as f:
@@ -322,7 +353,7 @@ def cmd_run(a):
     pack = dict(kv.split(':') for kv in a.pack.split(','))
     results = []
     print(f"{'top':>4} {'size':>16} {'kc':>5} {'mc':>5} {'nc':>6}  {'measured':>9} {'model':>9} "
-          f"{'ratio':>6}  model bound")
+          f"{'ratio':>6} {'GHz':>5}  model bound")
     for size, kc, mc, nc, top in itertools.product(a.size, a.kc, a.mc, a.nc, a.top):
         m, n, k = parse_size(size)
         args = ['--size', m, n, k, '--kc', kc, '--mc', mc, '--nc', nc, '--top', top,
@@ -334,6 +365,14 @@ def cmd_run(a):
             args += ['--events-file', events_file.name, '--group', a.group]
         _, row = run_bench(a.bench, args)
         meas, src = cycles(row, calib.get('ghz') or a.ghz)
+        # the clock this run ran at: cycles over time, or the one given
+        ghz_run = (float(row['cycles_min']) / float(row['ns_min'])
+                   if float(row['cycles_min']) > 0 and float(row['ns_min']) > 0
+                   else (calib.get('ghz') or a.ghz))
+        if clocked and not ghz_run:
+            raise SystemExit("--cache has ns or GB/s fields, but this run has no cycle "
+                             "counter to tell its clock: pass --ghz")
+        lev = levels if not clocked else levels_at(ghz_run)
         me, ne, ke = int(row['m_exec']), int(row['n_exec']), int(row['k_exec'])
         work = float(row['work'])
 
@@ -342,11 +381,11 @@ def cmd_run(a):
         if pack['A'] != 'ic' and 'A' not in out or pack['B'] != 'pc' and 'B' not in out:
             flags.append('pack placement differs from BLIS: model assumes in-place repacking')
         pk = model.packing(calib['pack_rate_a'], calib['pack_rate_b'], outside=out)
-        lv, mem = levels, None
+        lv, mem = lev, None
         if top != 'jc' and not a.no_steady:
             foot = 8 * (me * ke * ('A' not in out and 2 or 1) + ke * ne * ('B' not in out and 2 or 1)
                         + me * ne)
-            lv, mem = steady_levels(levels, foot)
+            lv, mem = steady_levels(lev, foot)
             if mem:
                 flags.append(f'steady state: {mem} as memory')
         b = model.blocking(kc, mc, nc)
@@ -386,8 +425,10 @@ def cmd_run(a):
                     res[f"l1d_miss_latency_{w}"] = o / r       # Little's law
                     res[f"l1d_misses_in_flight_{w}"] = o / t
         results.append(res)
+        res['ghz'] = ghz_run
         print(f"{top:>4} {f'{me}x{ne}x{ke}':>16} {kc:>5} {mc:>5} {nc:>6}  {fm:9.2f} {fp:9.2f} "
-              f"{fm / fp:6.2f}  {pred.bound}" + (f"   [{res['flags']}]" if flags else ''))
+              f"{fm / fp:6.2f} {f'{ghz_run:.2f}' if ghz_run else '-':>5}  {pred.bound}"
+              + (f"   [{res['flags']}]" if flags else ''))
         for canon in emap:
             mv, pv = res.get(f"{canon}_measured"), res.get(f"{canon}_model")
             if mv is not None and pv:
@@ -440,7 +481,11 @@ def main(argv=None):
                         "--prefetch then charges them)")
     c.add_argument('--events-map', help='events.json from probe_events.py: measure '
                                         'loads and stores per call (--call-uops)')
-    c.add_argument('--vl', type=int, default=64, help='vector length in bytes, as run')
+    c.add_argument('--vl', type=int, default=64,
+                   help='vector length in bytes, as run (NEON 16, AVX2 or 256-bit RVV 32)')
+    c.add_argument('--peak', type=float,
+                   help="the micro-kernel's peak, FLOP/cycle, if known: fixes the "
+                        "slope, so only the per-call cost is fitted")
     c.add_argument('--group', type=int, default=4)
     c.add_argument('--l1', type=int, help='L1 data cache bytes (default: from sysfs)')
     r = sub.choices['run']
@@ -459,10 +504,11 @@ def main(argv=None):
                    help="prefetches goto_bench issues between calls (and the model gets)")
     r.add_argument('--kernel-prefetch', nargs='*', default=[], metavar='PF',
                    help="prefetches inside the micro-kernel, for the model only, in "
-                        "model.py's syntax (lead in k-steps); end one in @KMIN if the "
+                        "model.py's syntax (lead in k-steps, or k for the whole "
+                        "k-loop: issued at the call's start); end one in @KMIN if the "
                         "kernel issues it only when k_c >= KMIN.  AOCL's 8x24 dgemm "
-                        "kernel prefetches its C tile 100-128 k-steps ahead, and only "
-                        "for k_c >= 128: ir:C:L1:keep:100@128")
+                        "kernel: ir:C:L1:keep:100@128; BLIS's armv8a 8x6: "
+                        "ir:C:L1:keep:k")
     r.add_argument('--pf-streams', type=int, default=0,
                    help="hardware prefetcher streams, as model.py (0: not modelled)")
     r.add_argument('--pf-min-run', type=int, default=4,
@@ -475,8 +521,7 @@ def main(argv=None):
                         "AOCL's 8x24 dgemm kernel), for the L1D_CACHE uop counts")
     r.add_argument('--sw-pf-holds-inner', action='store_true',
                    help="software prefetches into an outer level hold the inner "
-                        "levels' fill buffers until they land, as model.py "
-                        "(Zen 5's PREFETCHT1 does)")
+                        "levels' fill buffers until they land, as model.py")
     r.add_argument('--call-uops', default='0', metavar='LD[/ST]',
                    help="memory uops per call outside the k-loop and the C tile, "
                         "as model.py --call-uops (AOCL's 8x24 kernel in goto_bench "
