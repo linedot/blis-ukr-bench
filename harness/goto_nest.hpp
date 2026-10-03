@@ -450,8 +450,8 @@ private:
                 const dim_t m_r = std::min(mr, m_c - ir * mr);
                 // next panels exactly as BLIS's macro-kernel sets them
                 const bool last_ir = ir == ir_n - 1;
-                bli_auxinfo_set_next_a(last_ir ? a_blk : a1 + ps_a, &aux);
-                bli_auxinfo_set_next_b(last_ir ? (jr == jr_n - 1 ? b_blk : b1 + ps_b) : b1, &aux);
+                bli_auxinfo_set_next_a(const_cast<double*>(last_ir ? a_blk : a1 + ps_a), &aux);
+                bli_auxinfo_set_next_b(const_cast<double*>(last_ir ? (jr == jr_n - 1 ? b_blk : b1 + ps_b) : b1), &aux);
                 enter(R_IR, 1);
                 if (hooks) prefetch_hook(jc, pc, ic, jr, ir);
                 double* c11 = C + (i0 + ir * mr) * rs_c + (j0 + jr * nr) * cs_c;
