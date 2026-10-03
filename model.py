@@ -210,6 +210,7 @@ class cache_level:
     wbuf: int = 0
     shared_buf: bool = True
     lat: float = 0.0
+    victim: bool = False
 
     @property
     def cap(self) -> float:
@@ -1599,6 +1600,12 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
         # the innermost boundary.
         if write_allocate and not u.c_read and li:
             rd['C'] = wr['C']
+        # every line filled into a victim level is evicted into this one in
+        # the end, clean or dirty: a line read and written still goes once
+        if li and levels[li - 1].victim and L.size != float('inf'):
+            for op, v in rd.items():
+                wr[op] = max(wr.get(op, 0.0), v)
+            pk_wr = max(pk_wr, pk_rd)
 
         if L.size == float('inf'):
             holds, miss = [r for r in rungs if r not in inner], None
@@ -1898,7 +1905,7 @@ def parse_hierarchy(spec : str | list[str], ghz : float=None) -> list[cache_leve
     Each entry is positional, ':'-separated, and any field may be left empty
     to take its default:
 
-        size : line : assoc : rd[/wr] : usable : mshr[/wbuf] : latency
+        size : line : assoc : rd[/wr] : usable : mshr[/wbuf] : latency [: v]
 
         32K:64:8:128/64:1.0:16/8:5    fully specified
         768K:::64/32                  only size and bandwidth given
@@ -1918,6 +1925,11 @@ def parse_hierarchy(spec : str | list[str], ghz : float=None) -> list[cache_leve
 
         INF:::60G/30G:::55ns          main memory, in time units
 
+    A trailing v marks a level whose evictions all go to the next level, clean
+    lines too: the next one is a victim cache of it, or exclusive of it.  Its
+    write-backs are then every line it was filled with, not only the dirty
+    ones -- TSV110's L1 and L2, Zen's L2 (whose L3 is a victim cache).
+
     :param spec: a list of entries, one ';'-separated string, or a preset name
     :param ghz: the core clock, for fields given in ns or GB/s
     :return: the levels, in the order given
@@ -1934,7 +1946,7 @@ def parse_hierarchy(spec : str | list[str], ghz : float=None) -> list[cache_leve
     levels, nfin = [], 0
     for ent in entries:
         f = [x.strip() for x in ent.split(':')]
-        f += [''] * (7 - len(f))
+        f += [''] * (8 - len(f))
         if not f[0]:
             raise ValueError(f"entry {ent!r} needs a size")
         size = parse_size(f[0])
@@ -1956,9 +1968,11 @@ def parse_hierarchy(spec : str | list[str], ghz : float=None) -> list[cache_leve
         else:
             nfin += 1
             name = f'L{nfin}'
+        if f[7] and f[7].lower() not in ('v', 'victim'):
+            raise ValueError(f"entry {ent!r}: the 8th field is v (victim) or empty")
         levels.append(cache_level(name, size, line, assoc, rbw, wbw,
                                   shared_bw, usable, mshr, wbuf, shared_buf,
-                                  lat))
+                                  lat, victim=bool(f[7])))
     if not levels:
         raise ValueError('empty hierarchy')
     return levels
@@ -3050,6 +3064,24 @@ def selftest() -> int:
         pq.m * pq.n * u8.size('C'))
     edge = analyse(u8, blocking(64, 64, 20), problem(64, 20, 64), lv, free)
     chk("n = 20, n_r = 8: 3 column tiles, not 2.5", edge.calls, 8 * 3)
+
+    print("\na victim level writes back every line it was filled with")
+    vp = '32K:64::-1::16:5:{v};1M:64::-1::32:18:{v};8M:64::-1::32:40:{w};INF:::-1:::150'
+    plain = counters(analyse(u, b, p, parse_hierarchy(vp.format(v='', w='')),
+                             free)).events
+    vict = counters(analyse(u, b, p, parse_hierarchy(vp.format(v='v', w='')),
+                            free)).events
+    last = counters(analyse(u, b, p, parse_hierarchy(vp.format(v='', w='v')),
+                            free)).events
+    chk("plain: L1 writes back only C, less than it is filled with",
+        float(plain['L1D_CACHE_WB'] < plain['L1D_CACHE_REFILL']), 1.0)
+    chk("victim L1: write-backs == fills", vict['L1D_CACHE_WB'], vict['L1D_CACHE_REFILL'])
+    chk("... and L2 receives them all", vict['L2D_CACHE_WR'], vict['L1D_CACHE_WB'])
+    chk("victim L2: its write-backs == its refills", vict['L2D_CACHE_WB'],
+        vict['L2D_CACHE_REFILL'])
+    chk("... the reads do not change", vict['L1D_CACHE_REFILL'], plain['L1D_CACHE_REFILL'])
+    chk("the last cache marked v writes nothing clean to memory",
+        last['L3D_CACHE_WB'], plain['L3D_CACHE_WB'])
 
     print("\nlevels outside the core clock: ns and GB/s convert at the clock")
     mem = parse_hierarchy('INF:::60G/30G:::55ns', ghz=5.0)[0]

@@ -189,7 +189,15 @@ the epilogue's wait for C (`model.py --call-extra`): a call costs the larger.
 
 `--cache` latencies are increments along the chain -- what each level adds to
 a miss from the level above -- not load-to-use totals: with totals of 7, 14
-and 46 cycles for L1, L2 and L3 hits, the spec says 7, 7 and 32. Without a cycle counter, cycles come from ns * `--ghz`, and
+and 46 cycles for L1, L2 and L3 hits, the spec says 7, 7 and 32.
+
+A trailing `:v` on a level marks it as one whose evictions all go to the next
+level, clean lines too -- the next is exclusive of it, or a victim cache. Its
+write-backs are then every line it was filled with, not just the dirty ones:
+`64K:64:4:32/16:1.0:10:7:v`. TSV110's L1 and L2 behave so (their write-back
+counters follow their fills, though A and B are never written), as does Zen's
+L2, whose L3 is a victim cache. A `v` on the last cache adds nothing: memory
+holds every line already. Without a cycle counter, cycles come from ns * `--ghz`, and
 peak is then only relative to that clock.
 
 `run` measures every combination of the sweep values and replays each through
