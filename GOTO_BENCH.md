@@ -106,19 +106,42 @@ Counters: probe_events.py
 ```
 probe_events.py                 # map model.py's events onto this machine's
 probe_events.py --write events  # events.txt for goto_bench, events.json map
-probe_events.py --list          # every cache/memory/stall event found
+probe_events.py --list          # every cache/memory/latency event found
 ```
 
 Reads `/sys/bus/event_source/devices/*` and, if installed, `perf list -j`, and
-computes encodings as perf does. Arm (Grace, Kunpeng 920): the model's events
-are architected common events with fixed numbers, so the mapping is reliable.
-x86 and RISC-V: the vendor names it looks for are candidates; check `--list`.
+computes encodings as perf does. Each event has candidates in order of
+preference, checked against perf list on Kunpeng 920, Zen 5 and SpacemiT K1;
+a candidate that only approximates the model's meaning is printed with a note
+(`[demand misses only]`). Kernel generic events are taken only where perf
+lists them as supported, and generic last-level-cache events go to whichever
+level is last here (from sysfs: L2 on K1, L3 on Zen 5).
+
+Besides the model's events (L1D/L2D accesses, refills and write-backs, the
+`_RD`/`_WR` splits, and `L1D_MISS_OCCUPANCY`) it maps a few the model does not
+predict but that explain a run: `STALL_BACKEND`, `STALL_BACKEND_MEM`,
+`LOAD_QUEUE_STALL`, `L1D_SW_PREFETCH_REFILL`.
+
+Where events are missing it says why: on AMD, an unloaded amd-uncore module;
+on RISC-V, a core whose mvendorid-marchid-mimpid perf's mapfile lacks, so only
+generic events have names.
+
 Encodings come out as `PMU:<type>:<config>`, which needs the patched
 `performance_counters` backend. Entries that are not one concrete event are
 skipped and counted: the term syntax recent perf lists for each PMU
 (`ibs_op/ldlat=0..0xfff,.../`), `?` parameters, and values too wide for their
 field. Modifiers (`/u`) and perf's own terms (`period=`) are dropped. Needs
 Python 3.8 or later.
+
+### Miss occupancy
+
+`L1D_MISS_OCCUPANCY` is the number of L1D misses in flight, summed over cycles
+(AMD Zen 4/5 `ls_alloc_mab_count`, Intel `l1d_pend_miss.pending`). The model
+predicts it from the same chained latencies it uses for its fill-buffer
+limits, so with `L1D_CACHE_REFILL` it gives, by Little's law, the mean L1 miss
+latency and the misses in flight on average -- measured and predicted. The
+model uses unloaded latencies: a measured excess is queueing. `validate.py`
+prints both whenever the two events are mapped.
 
 Validating the model: validate.py
 ---------------------------------
@@ -144,7 +167,11 @@ Packing placed above `--top` is packed outside the region, so the model gets
 `packing.outside`; a region below `jc` repeats on the same data, so the
 smallest cache that holds it is treated as memory (`--no-steady` to turn that
 off). It compares cycles, and FLOP/cycle on the same 2*m*n*k work, plus the
-counters mapped by `--events-map`. Runs with a packing placement other than
+counters mapped by `--events-map`: the model's events with their ratio, the
+others as measured only. `--vl` sets the vector length the model's
+`L1D_CACHE` uop counts assume (64 B for SME or AVX-512, 32 for AVX2 or 256-bit
+RVV, 16 for NEON); they also assume both panels are loaded as vectors, so for a
+kernel that broadcasts B element by element, `L1D_CACHE` undercounts. Runs with a packing placement other than
 BLIS's are flagged: the model's in-place repacking rule assumes it.
 
 The bandwidths, latencies and buffer counts in `--cache` are not in sysfs and

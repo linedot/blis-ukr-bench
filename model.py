@@ -1554,6 +1554,26 @@ def occupancy(an : analysis, phase : str='ukr') -> list[buffer_load]:
     :param phase: 'ukr' or 'pack'
     :return: one buffer_load per holder -- the core, then every cache level
     """
+    out = []
+    for name, L, rnum, wnum in _buffer_cycles(an, phase):
+        if L.shared_buf and L.mshr:
+            # one pool: reads and writes compete for the same slots
+            out.append(buffer_load(name, (rnum + wnum) / L.mshr, None, True))
+        else:
+            out.append(buffer_load(name,
+                                   rnum / L.mshr if L.mshr else None,
+                                   wnum / L.wbuf if L.wbuf else None, False))
+    return out
+
+
+def _buffer_cycles(an : analysis, phase : str='ukr'):
+    """
+    The numerators of occupancy(): buffer-cycles each holder's read and write
+    buffers are occupied for over one phase, i.e. requests in flight summed
+    over the phase's cycles -- what an occupancy counter integrates.
+    :return: (holder name, holder, read buffer-cycles, write buffer-cycles)
+             per holder, the core first, then every cache level
+    """
     bds = an.boundaries
     idx = {bd.level.name: i for i, bd in enumerate(bds)}
     # the core is served from the innermost level out, in that level's lines;
@@ -1575,13 +1595,7 @@ def occupancy(an : analysis, phase : str='ukr') -> list[buffer_load]:
             rnum += nb / line * bds[j].level.lat
         wnum = (bds[first].phase_wr(phase) / line * bds[first].level.lat
                 if first < len(bds) else 0.0)
-        if L.shared_buf and L.mshr:
-            # one pool: reads and writes compete for the same slots
-            out.append(buffer_load(name, (rnum + wnum) / L.mshr, None, True))
-        else:
-            out.append(buffer_load(name,
-                                   rnum / L.mshr if L.mshr else None,
-                                   wnum / L.wbuf if L.wbuf else None, False))
+        out.append((name, L, rnum, wnum))
     return out
 
 
@@ -2216,10 +2230,12 @@ def counters(an : analysis, vl : int=64) -> pmu_prediction:
                           + (u.m_r * u.n_r * sc / vl if u.c_read else 0))
     uops_st = an.calls * u.m_r * u.n_r * sc / vl
     w = an.pack_elems
-    uops_pack = (w['A'] * sa + w['B'] * sb) * 2 / vl
+    uops_pack = (w['A'] * sa + w['B'] * sb) * 2 / vl    # read once, written once
 
     ev = {'CPU_CYCLES': pred.time,
-          'L1D_CACHE': uops_ld + uops_st + uops_pack}
+          'L1D_CACHE': uops_ld + uops_st + uops_pack,
+          'L1D_CACHE_RD': uops_ld + uops_pack / 2,
+          'L1D_CACHE_WR': uops_st + uops_pack / 2}
     for i, bd in enumerate(bds[:-1]):            # every real cache
         L, nxt = bd.level, bds[i + 1]
         # the core's PMU counts its own caches, L1D, L2D, ...; a level named
@@ -2227,11 +2243,29 @@ def counters(an : analysis, vl : int=64) -> pmu_prediction:
         # for an uncore or memory-controller counter to check
         pre = f'{L.name}D_CACHE' if _core_cache(L.name) else L.name
         if i:                                    # L2 accesses = L1 refill+wb
-            ev[pre if _core_cache(L.name) else f'{pre}_ACCESS'] = (
-                (bd.tot_rd + bd.tot_wr) / bds[i - 1].level.line)
+            up = bds[i - 1].level.line
+            if _core_cache(L.name):
+                ev[pre] = (bd.tot_rd + bd.tot_wr) / up
+                # split as Arm's L2D_CACHE_RD/_WR: the refills of the level
+                # above, and its write-backs -- vendors whose access counters
+                # see only the reads compare against _RD
+                ev[f'{pre}_RD'] = bd.tot_rd / up
+                ev[f'{pre}_WR'] = bd.tot_wr / up
+            else:
+                ev[f'{pre}_ACCESS'] = (bd.tot_rd + bd.tot_wr) / up
         # a refill brings in one of THIS level's lines
         ev[f'{pre}_REFILL'] = nxt.tot_rd / L.line
         ev[f'{pre}_WB'] = nxt.tot_wr / L.line
+    # requests in flight in each core cache's miss buffers, summed over the
+    # run's cycles: what an occupancy counter integrates (AMD's
+    # ls_alloc_mab_count, Intel's l1d_pend_miss.pending for L1).  Built from
+    # the unloaded latencies, so a measured excess is queueing; divided by
+    # the level's refills it is the mean miss latency
+    for ph in ('ukr', 'pack'):
+        for name, _, rnum, _ in _buffer_cycles(an, ph):
+            if name != 'core' and _core_cache(name):
+                key = f'{name}D_MISS_OCCUPANCY'
+                ev[key] = ev.get(key, 0.0) + rnum
     ksteps = p.m * p.n * p.k / (u.m_r * u.n_r)
     return pmu_prediction(ev, ksteps, an.calls, pred)
 
@@ -2268,6 +2302,12 @@ def report_counters(an : analysis, vl : int=64):
     if rf2:
         print(f"  L2D_CACHE_REFILL / L1D_CACHE_REFILL  {100*rf2/rf1:8.1f} %"
               f"       <- residency vs latency test")
+    occ1 = pm.events.get('L1D_MISS_OCCUPANCY', 0)
+    if occ1 and rf1:
+        print(f"  L1D_MISS_OCCUPANCY / L1D_CACHE_REFILL {occ1/rf1:7.1f} cy"
+              f"      <- mean L1 miss latency, unloaded")
+        print(f"  L1D_MISS_OCCUPANCY / CPU_CYCLES      {occ1/t:8.2f}"
+              f"          <- misses in flight on average")
     print(f"  predicted limiter                    {pm.pred.limiter}")
     print(f"\n  perf stat -e cycles,l1d_cache,l1d_cache_refill,l1d_cache_wb,"
           f"l2d_cache,l2d_cache_refill,l2d_cache_wb \\\n"
@@ -2753,6 +2793,20 @@ def selftest() -> int:
         a_out.boundaries[1].ukr_rd, a_in.boundaries[1].ukr_rd)
     chk("only A outside: B's packing remains",
         a_a.pack_elems['B'], a_in.pack_elems['B'])
+
+    print("\nmiss occupancy chains the latencies: a mean L1 miss pays the L2")
+    print("latency, plus the memory latency for the share that misses L2 too")
+    lv = parse_hierarchy('32K:64::-1::16:5;1M:64::-1::32:18;INF:::-1:::150')
+    ev = counters(analyse(u, b, p, lv, free)).events
+    r1, r2 = ev['L1D_CACHE_REFILL'], ev['L2D_CACHE_REFILL']
+    chk("L1 occupancy / L1 refills == 18 + (R2/R1)*150",
+        ev['L1D_MISS_OCCUPANCY'] / r1, 18 + r2 / r1 * 150)
+    chk("L2 occupancy / L2 refills == 150", ev['L2D_MISS_OCCUPANCY'] / r2, 150)
+    chk("L2D_CACHE == L2D_CACHE_RD + L2D_CACHE_WR", ev['L2D_CACHE'],
+        ev['L2D_CACHE_RD'] + ev['L2D_CACHE_WR'])
+    chk("L2D_CACHE_RD == L1D_CACHE_REFILL", ev['L2D_CACHE_RD'], r1)
+    chk("L1D_CACHE == L1D_CACHE_RD + L1D_CACHE_WR", ev['L1D_CACHE'],
+        ev['L1D_CACHE_RD'] + ev['L1D_CACHE_WR'])
 
     print(f"\n{'ALL CHECKS PASSED' if ok else 'FAILURES ABOVE'}")
     return 0 if ok else 1

@@ -43,33 +43,103 @@ import shutil
 import subprocess
 import sys
 
-# The model's events (model.py counters()), and what to look for.  Each
-# candidate is a perf/sysfs event name (case-insensitive); the first one found
-# wins.  'generic:' candidates are the counter backend's built-in names.
+# The model's events (model.py counters()), and a few it does not predict but
+# that explain a run.  Candidates are tried in order and the first one this
+# machine has wins: (event name as sysfs or perf list spells it, any case;
+# a note when it only approximates the model's meaning).  'generic:' names a
+# kernel generic event, taken only where perf lists it as supported.  Names
+# checked against perf list on Kunpeng 920, AMD Zen 5 and SpacemiT K1 (X60).
 CANONICAL = {
-    'CPU_CYCLES':       ['cpu_cycles', 'cycles', 'generic:CYCLES'],
-    'INST_RETIRED':     ['inst_retired', 'instructions', 'generic:INSTRUCTIONS'],
-    'L1D_CACHE':        ['l1d_cache',                         # Arm 0x04
-                         'l1d.all_ref',
-                         'generic:L1D_READ_ACCESS'],
-    'L1D_CACHE_REFILL': ['l1d_cache_refill',                  # Arm 0x03
-                         'l1d.replacement',                   # Intel
-                         'ls_any_fills_from_sys.all',         # AMD Zen 4/5
-                         'ls_refills_from_sys.all',           # AMD Zen 2/3
-                         'generic:L1D_READ_MISS'],
-    'L1D_CACHE_WB':     ['l1d_cache_wb'],                     # Arm 0x15
-    'L2D_CACHE':        ['l2d_cache',                         # Arm 0x16
-                         'l2_rqsts.references',               # Intel
-                         'l2_request_g1.all_no_prefetch'],    # AMD
-    'L2D_CACHE_REFILL': ['l2d_cache_refill',                  # Arm 0x17
-                         'l2_lines_in.all',                   # Intel
-                         'l2_cache_req_stat.ic_dc_miss_in_l2'],  # AMD
-    'L2D_CACHE_WB':     ['l2d_cache_wb',                      # Arm 0x18
-                         'l2_lines_out.non_silent'],          # Intel
-    'L3D_CACHE_REFILL': ['l3d_cache_refill',                  # Arm 0x2a
-                         'll_cache_miss_rd',                  # Arm 0x37
-                         'generic:LL_READ_MISS'],
-    'STALL_BACKEND':    ['stall_backend'],                    # Arm 0x24
+    'CPU_CYCLES': [('cpu_cycles', ''), ('cycles', ''), ('generic:CYCLES', '')],
+    'INST_RETIRED': [('inst_retired', ''), ('instructions', ''),
+                     ('generic:INSTRUCTIONS', '')],
+    # memory uops: loads + stores, and each part
+    'L1D_CACHE': [
+        ('l1d_cache', ''),                                     # Arm 0x04
+        ('l1d_access', ''),                                    # SpacemiT X60
+        ('ls_dispatch.all', 'memory ops dispatched, speculative ones too')],
+    'L1D_CACHE_RD': [
+        ('l1d_cache_rd', ''),                                  # Arm 0x40
+        ('l1d_load_access', ''),                               # X60
+        ('ls_dispatch.ld_dispatch', 'load ops dispatched, speculative ones too'),
+        ('mem_inst_retired.all_loads', ''),                    # Intel
+        ('generic:L1D_READ_ACCESS', '')],
+    'L1D_CACHE_WR': [
+        ('l1d_cache_wr', ''),                                  # Arm 0x41
+        ('l1d_store_access', ''),                              # X60
+        ('ls_dispatch.store_dispatch', 'store ops dispatched, speculative ones too'),
+        ('mem_inst_retired.all_stores', ''),                   # Intel
+        ('generic:L1D_WRITE_ACCESS', '')],
+    # lines brought into L1D, prefetched ones included
+    'L1D_CACHE_REFILL': [
+        ('l1d_cache_refill', ''),                              # Arm 0x03
+        ('l1d.replacement', ''),                               # Intel
+        ('ls_any_fills_from_sys.all', ''),                     # AMD Zen 4/5
+        ('ls_refills_from_sys.all', ''),                       # AMD Zen 2/3
+        ('l1d_miss', 'demand misses; prefetched lines are l1d_prefetch_refill'),
+        ('generic:L1D_READ_MISS', 'load misses only')],
+    'L1D_CACHE_WB': [('l1d_cache_wb', '')],                    # Arm 0x15
+    # misses in flight, summed over cycles: fill-buffer occupancy
+    'L1D_MISS_OCCUPANCY': [
+        ('ls_alloc_mab_count', ''),                            # AMD Zen 4/5
+        ('l1d_pend_miss.pending', '')],                        # Intel
+    # accesses arriving at L2: L1 refills + L1 write-backs, and each part
+    'L2D_CACHE': [('l2d_cache', '')],                          # Arm 0x16
+    'L2D_CACHE_RD': [
+        ('l2d_cache_rd', ''),                                  # Arm 0x50
+        ('l2_request_g1.all_dc', ''),                          # AMD Zen
+        ('l2_load_access', 'loads only'),                      # X60
+        ('l2_rqsts.references', 'L2 prefetcher requests too')],   # Intel
+    'L2D_CACHE_WR': [
+        ('l2d_cache_wr', ''),                                  # Arm 0x51
+        ('l2_store_access', 'store accesses: unverified as L1 write-backs')],
+    'L2D_CACHE_REFILL': [
+        ('l2d_cache_refill', ''),                              # Arm 0x17
+        ('l2_lines_in.all', ''),                               # Intel
+        ('l2_fill_rsp_src.all', ''),                           # AMD Zen 5
+        ('l2_cache_req_stat.ic_dc_miss_in_l2',
+         'demand misses only, instruction fetches included'),
+        ('l2_load_miss', 'load misses only'),                  # X60
+        ('generic:LL_READ_MISS', 'reads only')],     # where L2 is the last level
+    'L2D_CACHE_WB': [
+        ('l2d_cache_wb', ''),                                  # Arm 0x18
+        ('l2_lines_out.non_silent', '')],                      # Intel
+    'L2D_MISS_OCCUPANCY': [
+        ('offcore_requests_outstanding.all_data_rd', 'data reads only')],
+    'L3D_CACHE_REFILL': [
+        ('l3d_cache_refill', ''),                              # Arm 0x2a
+        ('ll_cache_miss_rd', 'reads only'),                    # Arm 0x37
+        ('l2_fill_rsp_src.dram_io_near', 'lines from local DRAM'),  # AMD Zen 5
+        ('generic:LL_READ_MISS', 'reads only')],
+    # not predicted by the model
+    'STALL_BACKEND': [
+        ('stall_backend', ''),                                 # Arm 0x24
+        ('stalled_cycle_backend', ''),                         # X60
+        ('generic:STALLED_CYCLES_BACKEND', ''),
+        ('de_no_dispatch_per_slot.backend_stalls',
+         'dispatch slots, up to 8 per cycle')],                # AMD Zen 4/5
+    'STALL_BACKEND_MEM': [
+        ('stall_backend_mem', ''),                             # Arm 0x4005
+        ('ex_no_retire.load_not_complete',
+         'cycles in which retirement waits on a load')],       # AMD Zen
+    'LOAD_QUEUE_STALL': [
+        ('de_dispatch_stall_cycle_dynamic_tokens_part1.load_queue_rsrc_stall',
+         'cycles dispatch waits for load-queue tokens')],      # AMD Zen 5
+    'L1D_SW_PREFETCH_REFILL': [('ls_sw_pf_dc_fills.all', '')],  # AMD Zen
+}
+
+# Kernel generic events: the spec goto_bench takes, and perf's name for the
+# event, which perf list shows only where the kernel supports it.
+GENERIC = {
+    'CYCLES':                 ('CYCLES', 'cpu-cycles'),
+    'INSTRUCTIONS':           ('INSTRUCTIONS', 'instructions'),
+    'L1D_READ_ACCESS':        ('L1D_READ_ACCESS', 'l1-dcache-loads'),
+    'L1D_READ_MISS':          ('L1D_READ_MISS', 'l1-dcache-load-misses'),
+    'L1D_WRITE_ACCESS':       ('L1D_WRITE_ACCESS', 'l1-dcache-stores'),
+    'L1D_WRITE_MISS':         ('L1D_WRITE_MISS', 'l1-dcache-store-misses'),
+    'LL_READ_ACCESS':         ('LL_READ_ACCESS', 'llc-loads'),
+    'LL_READ_MISS':           ('LL_READ_MISS', 'llc-load-misses'),
+    'STALLED_CYCLES_BACKEND': ('PMU:0:0x8', 'stalled-cycles-backend'),
 }
 
 # Arm's architected numbers, for when sysfs is unreadable but the CPU is Arm.
@@ -77,7 +147,9 @@ ARM_COMMON = {
     'l1d_cache_refill': 0x03, 'l1d_cache': 0x04, 'inst_retired': 0x08,
     'cpu_cycles': 0x11, 'l1d_cache_wb': 0x15, 'l2d_cache': 0x16,
     'l2d_cache_refill': 0x17, 'l2d_cache_wb': 0x18, 'stall_backend': 0x24,
-    'l3d_cache_refill': 0x2a, 'll_cache_miss_rd': 0x37,
+    'l3d_cache_refill': 0x2a, 'll_cache_miss_rd': 0x37, 'l1d_cache_rd': 0x40,
+    'l1d_cache_wr': 0x41, 'l2d_cache_rd': 0x50, 'l2d_cache_wr': 0x51,
+    'stall_backend_mem': 0x4005,
 }
 
 
@@ -169,22 +241,36 @@ def sysfs_pmus(root):
 
 
 def perf_list_events():
-    """[(name, 'pmu/terms/')] from `perf list -j`, when perf is installed."""
+    """
+    ([(name, 'pmu/terms/')], {every event name perf lists, lowercased}) from
+    `perf list -j`.  The set is None when perf is not there, or when it lists
+    no legacy events at all (an output this script does not understand):
+    then nothing can be ruled out.
+    """
     perf = shutil.which('perf')
     if not perf:
-        return []
+        return [], None
     try:
         out = subprocess.run([perf, 'list', '-j'], capture_output=True,
                              text=True, timeout=60).stdout
         data = json.loads(out)
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-        return []
-    found = []
+        return [], None
+    found, listed = [], set()
     for ev in data:
         name, enc = ev.get('EventName'), ev.get('Encoding')
         if name and enc and '/' in enc:
             found.append((name, enc))
-    return found
+        for field in ('EventName', 'EventAlias'):
+            for alias in (ev.get(field) or '').split(' OR '):
+                alias = alias.strip().lower()
+                if '/' in alias:                       # cpu/L1-dcache-loads/
+                    alias = alias.strip('/').rpartition('/')[2]
+                if alias:
+                    listed.add(alias)
+    if not listed & {'cpu-cycles', 'cycles', 'instructions'}:
+        listed = None
+    return found, listed
 
 
 def spec_for(pmu, info, regs):
@@ -217,7 +303,7 @@ def candidates(pmus, perf_events):
         regs = encode(terms, info['formats'])
         spec = regs is not None and spec_for(pmu, info, regs)
         if spec:
-            table.setdefault(name.lower(), (spec, f"perf list {enc}"))
+            table.setdefault(name.lower(), (spec, f"perf list {name} = {enc}"))
         else:
             skipped += 1
     return table, skipped
@@ -229,23 +315,79 @@ def is_arm(root):
         for p in os.listdir(os.path.join(root, 'bus/event_source/devices')))
 
 
-def choose(table, arm_fallback):
-    """{canonical: (spec, where)}, None where nothing was found."""
+def last_level(root):
+    """The highest data or unified cache level of cpu0, from sysfs; None if
+    sysfs does not say."""
+    levels = []
+    for d in glob.glob(os.path.join(root, 'devices/system/cpu/cpu0/cache/index*')):
+        if read(os.path.join(d, 'type')) != 'Instruction':
+            lv = read(os.path.join(d, 'level'))
+            if lv and lv.isdigit():
+                levels.append(int(lv))
+    return max(levels) if levels else None
+
+
+def choose(table, arm_fallback, listed, llc=None):
+    """
+    {canonical: (spec, where, note)}, None where nothing was found.  A
+    generic event is taken only if perf lists it (listed), or if there is no
+    perf list to tell; a generic last-level-cache event only for the level
+    that is last here (llc; L3 if unknown).
+    """
     chosen = {}
     for canon, cands in CANONICAL.items():
         pick = None
-        for c in cands:
-            if c.startswith('generic:'):
-                pick = (c.split(':', 1)[1], "kernel's generic event")
+        for name, note in cands:
+            if name.startswith('generic:'):
+                spec, perf_name = GENERIC[name.split(':', 1)[1]]
+                if listed is not None and perf_name not in listed:
+                    continue                             # the kernel lacks it
+                if spec.startswith('LL_') and not canon.startswith(f'L{llc or 3}D'):
+                    continue                             # not this machine's LLC
+                pick = (spec, "kernel's generic event" + (
+                    '' if listed is not None else ', unverified (no perf list)'), note)
                 break
-            if c in table:
-                pick = table[c]
+            if name in table:
+                pick = (*table[name], note)
                 break
-            if arm_fallback and c in ARM_COMMON:
-                pick = (f"RAW:{ARM_COMMON[c]:#x}", "Arm architected number (sysfs absent)")
+            if arm_fallback and name in ARM_COMMON:
+                pick = (f"RAW:{ARM_COMMON[name]:#x}",
+                        "Arm architected number (sysfs absent)", note)
                 break
         chosen[canon] = pick
     return chosen
+
+
+def cpuinfo(path):
+    """The first value of each /proc/cpuinfo key."""
+    info = {}
+    for line in (read(path) or '').splitlines():
+        k, _, v = line.partition(':')
+        info.setdefault(k.strip(), v.strip())
+    return info
+
+
+def hints(pmus, perf_events, cpu):
+    """Why events may be missing on this machine."""
+    out = []
+    if (cpu.get('vendor_id') == 'AuthenticAMD' or 'ibs_op' in pmus) \
+            and 'amd_l3' not in pmus:
+        out.append("no amd_l3 PMU: the amd-uncore module is not loaded "
+                   "(modprobe amd-uncore). perf's L3 latency metrics "
+                   "(l3_read_miss_latency) need it, and need system-wide "
+                   "counting besides, which goto_bench does not do; "
+                   "L1D_MISS_OCCUPANCY / L1D_CACHE_REFILL measures the mean "
+                   "L1 miss latency per thread instead")
+    if 'mvendorid' in cpu or os.uname().machine.startswith('riscv'):
+        vendor = [n for n, enc in perf_events if enc.partition('/')[0] == 'cpu']
+        if not vendor:
+            ids = '-'.join(cpu.get(k, '?') for k in ('mvendorid', 'marchid', 'mimpid'))
+            out.append(f"perf has no event tables for this core ({ids}, "
+                       "mvendorid-marchid-mimpid): its mapfile lacks the id, so "
+                       "only generic events have names. The PMU itself works; "
+                       "raw events (RAW:<code>) need the core's documentation, "
+                       "and firmware (OpenSBI) that maps them to counters")
+    return out
 
 
 def main(argv=None):
@@ -260,35 +402,49 @@ def main(argv=None):
     p.add_argument('--sysfs-root', default='/sys',
                    help='where sysfs is mounted (for testing)')
     p.add_argument('--no-perf', action='store_true', help='do not run perf list')
+    p.add_argument('--cpuinfo', default='/proc/cpuinfo', help=argparse.SUPPRESS)
     a = p.parse_args(argv)
 
     pmus = sysfs_pmus(a.sysfs_root)
-    perf_events = [] if a.no_perf else perf_list_events()
+    perf_events, listed = ([], None) if a.no_perf else perf_list_events()
+    have_perf = not a.no_perf and shutil.which('perf') is not None
     table, skipped = candidates(pmus, perf_events)
-    listed = ', '.join('%s (type %d)' % (k, v['type']) for k, v in pmus.items())
-    print(f"# PMUs: {listed or 'none'}")
+    listed_pmus = ', '.join('%s (type %d)' % (k, v['type']) for k, v in pmus.items())
+    print(f"# PMUs: {listed_pmus or 'none'}")
     print(f"# events: {len(table)} encodable"
           + (f", {len(perf_events)} from perf list" if perf_events else
+             ", perf lists no named events here" if have_perf else
              ", perf not available" if not a.no_perf else "")
           + (f"; {skipped} skipped as not one concrete event (term ranges, '?' "
              f"parameters, or values or terms the PMU cannot take)" if skipped else ""))
+    for h in hints(pmus, perf_events, cpuinfo(a.cpuinfo)):
+        print(f"# note: {h}")
 
     if a.list:
-        pat = re.compile(r'cache|refill|miss|wb|writeback|fill|stall|mem|l1d|l2|l3|llc', re.I)
+        pat = re.compile(r'cache|refill|miss|wb|writeback|fill|stall|mem|l1d|l2|'
+                         r'l3|llc|lat|occup|mab|pend|outstanding|dispatch|retire',
+                         re.I)
         for name in sorted(table):
             if pat.search(name):
                 print(f"  {name:<44} {table[name][0]:<24} {table[name][1]}")
         return 0
 
     arm_fallback = not table and os.uname().machine == 'aarch64'
-    chosen = choose(table, arm_fallback or (is_arm(a.sysfs_root) and not table))
+    chosen = choose(table, arm_fallback or (is_arm(a.sysfs_root) and not table),
+                    listed, last_level(a.sysfs_root))
     for canon, pick in chosen.items():
-        print(f"  {canon:<18} " + (f"{pick[0]:<24} {pick[1]}" if pick else "not found"))
+        if pick:
+            spec, where, note = pick
+            print(f"  {canon:<22} {spec:<20} {where}" + (f"  [{note}]" if note else ""))
+        else:
+            print(f"  {canon:<22} not found")
     if a.write:
         with open(a.write + '.txt', 'w') as f:
             for canon, pick in chosen.items():
                 if pick:
-                    f.write(f"{pick[0]:<24} # {canon}: {pick[1]}\n")
+                    spec, where, note = pick
+                    f.write(f"{spec:<24} # {canon}: {where}"
+                            + (f" [{note}]" if note else "") + "\n")
         with open(a.write + '.json', 'w') as f:
             json.dump({c: p[0] for c, p in chosen.items() if p}, f, indent=2)
         print(f"# wrote {a.write}.txt and {a.write}.json")

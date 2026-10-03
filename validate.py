@@ -264,19 +264,34 @@ def cmd_run(a):
                'ratio': fm / fp, 'model_bound': pred.bound, 'cycles_from': src,
                'flags': '; '.join(flags)}
         if emap:
-            ev = model.counters(an).events
+            ev = model.counters(an, a.vl).events
             for canon, spec in emap.items():
                 col = f"{spec}_min"
-                if col in row and canon in ev and ev[canon] > 0:
+                if col in row:
                     res[f"{canon}_measured"] = float(row[col])
-                    res[f"{canon}_model"] = ev[canon]
+                    if ev.get(canon, 0) > 0:
+                        res[f"{canon}_model"] = ev[canon]
+            occ = [res.get(f"L1D_MISS_OCCUPANCY_{w}") for w in ('measured', 'model')]
+            ref = [res.get(f"L1D_CACHE_REFILL_{w}") for w in ('measured', 'model')]
+            for w, o, r, t in zip(('measured', 'model'), occ, ref, (meas, pred.time)):
+                if o and r:
+                    res[f"l1d_miss_latency_{w}"] = o / r       # Little's law
+                    res[f"l1d_misses_in_flight_{w}"] = o / t
         results.append(res)
         print(f"{top:>4} {f'{me}x{ne}x{ke}':>16} {kc:>5} {mc:>5} {nc:>6}  {fm:9.2f} {fp:9.2f} "
               f"{fm / fp:6.2f}  {pred.bound}" + (f"   [{res['flags']}]" if flags else ''))
         for canon in emap:
-            if f"{canon}_measured" in res:
-                mv, pv = res[f"{canon}_measured"], res[f"{canon}_model"]
-                print(f"       {canon:<18} measured {mv:14.0f}  model {pv:14.0f}  ratio {mv / pv:6.2f}")
+            mv, pv = res.get(f"{canon}_measured"), res.get(f"{canon}_model")
+            if mv is not None and pv:
+                print(f"       {canon:<22} measured {mv:14.0f}  model {pv:14.0f}  ratio {mv / pv:6.2f}")
+            elif mv is not None:
+                print(f"       {canon:<22} measured {mv:14.0f}  (not modelled)")
+        for what, unit, key in (("mean L1D miss latency", "cy", "l1d_miss_latency"),
+                                ("L1D misses in flight", "  ", "l1d_misses_in_flight")):
+            mv, pv = res.get(f"{key}_measured"), res.get(f"{key}_model")
+            if mv is not None:
+                print(f"       {what:<22} measured {mv:11.2f} {unit}"
+                      + (f"  model {pv:11.2f} {unit}  ratio {mv / pv:6.2f}" if pv else ""))
     if results:
         r = [x['ratio'] for x in results]
         g = math.exp(sum(math.log(x) for x in r) / len(r))
@@ -326,6 +341,9 @@ def main(argv=None):
     r.add_argument('--c-layout', default='rm', choices=['rm', 'cm'])
     r.add_argument('--prefetch', nargs='*', default=[])
     r.add_argument('--core-mshr', type=int, default=0)
+    r.add_argument('--vl', type=int, default=64,
+                   help="vector length in bytes, for the model's L1D_CACHE uop counts: "
+                        "64 for SME or AVX-512, 32 for AVX2 or 256-bit RVV, 16 for NEON")
     r.add_argument('--events-map', help='events.json from probe_events.py')
     r.add_argument('--group', type=int, default=4)
     r.add_argument('--no-steady', action='store_true',
