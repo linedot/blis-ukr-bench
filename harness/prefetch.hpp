@@ -3,8 +3,10 @@
 // describe() says what a request actually turns into on this build -- the
 // model's target level and hint are only as real as that.
 //
-//   x86-64    prefetcht0/t1/t2 choose L1/L2/L3; 'strm' becomes prefetchnta
-//             (all levels, minimal pollution); write intent uses prefetchw.
+//   x86-64    prefetcht0/t1/t2 choose L1/L2/L3 (t1: every level but L1);
+//             'strm' becomes prefetchnta.  Write intent is prefetchw, which
+//             fills L1 only -- a write prefetch aimed at L2 or L3 keeps its
+//             level and drops the hint (AMD Zen 5 optimization guide, table 8)
 //   AArch64   PRFM {PLD,PST}{L1,L2,L3}{KEEP,STRM}: every combination exists.
 //   RISC-V    Zicbop prefetch.r / prefetch.w, with a Zihintntl hint in front
 //             to pick the level: ntl.p1 (not temporal in the innermost
@@ -39,7 +41,11 @@ inline void prefetch(const void* p, pf_kind k)
 #if defined(__x86_64__) || defined(__i386__)
     // memory operands, so this assembles under -masm=intel as well
     const char& m = *static_cast<const char*>(p);
-    if (k.write)
+    // t0 fills every level, t1 all but L1, t2 L3 and beyond; prefetchw takes
+    // the line into L1 for writing (AMD Zen 5 optimization guide, table 8).
+    // Write intent therefore exists at L1 only: a write prefetch aimed further
+    // out keeps its level and drops the hint
+    if (k.write && k.level == pf_level::L1)
         __asm__ volatile("prefetchw %0" ::"m"(m));
     else if (k.stream)
         __asm__ volatile("prefetchnta %0" ::"m"(m));
@@ -99,9 +105,11 @@ inline std::string describe(pf_kind k)
     const char lv = static_cast<char>('0' + static_cast<int>(k.level));
 #if defined(__x86_64__) || defined(__i386__)
     (void)lv;
-    if (k.write) return "prefetchw (level not selectable)";
-    if (k.stream) return "prefetchnta (level not selectable)";
-    return std::string("prefetcht") + static_cast<char>('0' + static_cast<int>(k.level) - 1);
+    if (k.write && k.level == pf_level::L1) return "prefetchw (into L1, for writing)";
+    if (k.stream) return "prefetchnta (non-temporal; level not selectable)";
+    return std::string("prefetcht") + static_cast<char>('0' + static_cast<int>(k.level) - 1)
+           + (k.write ? " (write intent exists only into L1 on x86: level kept, hint dropped)"
+                      : "");
 #elif defined(__aarch64__)
     return std::string("prfm ") + (k.write ? "pst" : "pld") + "l" + lv
            + (k.stream ? "strm" : "keep");
