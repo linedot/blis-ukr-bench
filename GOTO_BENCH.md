@@ -112,7 +112,19 @@ Counters: probe_events.py
 probe_events.py                 # map model.py's events onto this machine's
 probe_events.py --write events  # events.txt for goto_bench, events.json map
 probe_events.py --list          # every cache/memory/latency event found
+probe_events.py --include 'l2_a[rw]_channel|lsu|vlsu' --write events
+                                # ... plus every event matching, measured only
+probe_events.py --perf-json saved.json   # perf list -j saved elsewhere
 ```
+
+perf's own errors can land in the middle of its JSON (`Error: failed to open
+tracing events directory` before the closing bracket); the probe then parses
+entry by entry. perf's tables call the core PMU `default_core` whatever sysfs
+calls it (`cpu` on RISC-V and x86, `armv8_pmuv3_N` on Arm); the probe maps
+it. `--include REGEX` writes every encodable event whose name matches, under
+its own name: `validate.py` reports them as measured, not modelled -- the way
+to explore a core whose events the model has no slot for, such as the
+SpacemiT X60's L2 AR/AW channel stalls, LSU and vector-LSU stalls.
 
 Reads `/sys/bus/event_source/devices/*` and, if installed, `perf list -j`
 (perf 6.x; an older perf is reported as such), and computes encodings as perf

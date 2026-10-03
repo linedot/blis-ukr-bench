@@ -128,12 +128,15 @@ CANONICAL = {
          'cycles in which retirement waits on a load')],       # AMD Zen
     'LOAD_QUEUE_STALL': [
         ('de_dispatch_stall_cycle_dynamic_tokens_part1.load_queue_rsrc_stall',
-         'cycles dispatch waits for load-queue tokens')],      # AMD Zen 5
+         'cycles dispatch waits for load-queue tokens'),       # AMD Zen 5
+        ('eu_lsu_load_full', 'LSU load queue full; whether events or cycles is '
+                             'not documented')],               # SpacemiT X60
     'L1D_SW_PREFETCH_REFILL': [('ls_sw_pf_dc_fills.all', '')],  # AMD Zen
     # who brought the lines in -- to attribute refills the model does not
     # predict, and C lines that were in L2 before the kernel asked
     'L1D_DEMAND_REFILL': [('ls_dmnd_fills_from_sys.all', '')],       # AMD Zen
-    'L1D_HW_PREFETCH_REFILL': [('ls_hw_pf_dc_fills.all', '')],       # AMD Zen
+    'L1D_HW_PREFETCH_REFILL': [('ls_hw_pf_dc_fills.all', ''),        # AMD Zen
+                               ('l1d_prefetch_refill', '')],         # SpacemiT X60
     'L2_PF_DRAM_L2HW': [('l2_pf_miss_l2_l3.l2_hwpf',
                          'L2 prefetcher requests served by DRAM')],  # AMD Zen
     'L2_PF_DRAM_L1HW': [('l2_pf_miss_l2_l3.l1_dc_hwpf',
@@ -257,7 +260,28 @@ def sysfs_pmus(root):
     return pmus
 
 
-def perf_list_events():
+def parse_perf_json(text):
+    """
+    The entries of `perf list -j` output.  perf can print its own errors into
+    the same stream ('Error: failed to open tracing events directory' lands
+    between the last entry and the closing bracket), so when the whole does
+    not parse, every flat {...} object is parsed on its own.
+    """
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        pass
+    out = []
+    for m in re.finditer(r'\{[^{}]*\}', text, re.S):
+        try:
+            out.append(json.loads(m.group(0)))
+        except json.JSONDecodeError:
+            pass
+    return out
+
+
+def perf_list_events(json_file=None):
     """
     ([(name, 'pmu/terms/')], {every event name perf lists, lowercased},
     status) from `perf list -j`.  The set is None when perf is not there, or
@@ -265,14 +289,20 @@ def perf_list_events():
     understand): then nothing can be ruled out.  status is 'ok', 'missing'
     (no perf), or 'old' (perf without -j, which came in perf 6.x).
     """
-    perf = shutil.which('perf')
-    if not perf:
-        return [], None, 'missing'
-    try:
-        out = subprocess.run([perf, 'list', '-j'], capture_output=True,
-                             text=True, timeout=60).stdout
-        data = json.loads(out)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+    if json_file:
+        with open(json_file) as f:
+            data = parse_perf_json(f.read())
+    else:
+        perf = shutil.which('perf')
+        if not perf:
+            return [], None, 'missing'
+        try:
+            out = subprocess.run([perf, 'list', '-j'], capture_output=True,
+                                 text=True, timeout=300).stdout
+        except (OSError, subprocess.SubprocessError):
+            return [], None, 'old'
+        data = parse_perf_json(out)
+    if not data:
         return [], None, 'old'
     found, listed = [], set()
     for ev in data:
@@ -397,6 +427,20 @@ def spec_for(pmu, info, regs):
     return f"PMU:{info['type']}:{regs.get('config', 0):#x}"
 
 
+def core_pmu(pmus):
+    """
+    The core PMU's sysfs name.  perf's event tables call it default_core,
+    whatever sysfs calls it: cpu on x86 and RISC-V, armv8_pmuv3_N on Arm.
+    """
+    if 'cpu' in pmus:
+        return 'cpu'
+    for name, info in pmus.items():
+        if re.match(r'arm(v8|v9)?_|armv[89]|cpu_core', name) and \
+                ('cpu_cycles' in info['events'] or name == 'cpu_core'):
+            return name
+    return None
+
+
 def candidates(pmus, perf_events):
     """
     ({lowercased event name: (spec, where)} over every source, number of
@@ -411,8 +455,11 @@ def candidates(pmus, perf_events):
                 table.setdefault(name.lower(), (spec, f"sysfs {pmu}/{name}"))
             else:
                 skipped += 1
+    core = core_pmu(pmus)
     for name, enc in perf_events:
         pmu, _, rest = enc.partition('/')
+        if pmu == 'default_core' and core:
+            pmu = core
         terms = rest.rpartition('/')[0] if '/' in rest else rest   # drop /u, /k ...
         info = pmus.get(pmu)
         if not info:
@@ -505,7 +552,7 @@ def cpuinfo(path):
     return info
 
 
-def hints(pmus, perf_events, cpu):
+def hints(pmus, perf_events, cpu, perf_status='ok'):
     """Why events may be missing on this machine."""
     out = []
     if (cpu.get('vendor_id') == 'AuthenticAMD' or 'ibs_op' in pmus) \
@@ -517,8 +564,13 @@ def hints(pmus, perf_events, cpu):
                    "L1D_MISS_OCCUPANCY / L1D_CACHE_REFILL measures the mean "
                    "L1 miss latency per thread instead")
     if 'mvendorid' in cpu or os.uname().machine.startswith('riscv'):
-        vendor = [n for n, enc in perf_events if enc.partition('/')[0] == 'cpu']
-        if not vendor:
+        vendor = [n for n, enc in perf_events
+                  if enc.partition('/')[0] in ('cpu', 'default_core')]
+        if not vendor and perf_status != 'ok':
+            out.append("perf's event list could not be read here: its named "
+                       "events are unknown (save `perf list -j` from a perf that "
+                       "works and pass it with --perf-json)")
+        elif not vendor:
             ids = '-'.join(cpu.get(k, '?') for k in ('mvendorid', 'marchid', 'mimpid'))
             out.append(f"perf has no event tables for this core ({ids}, "
                        "mvendorid-marchid-mimpid): its mapfile lacks the id, so "
@@ -540,6 +592,12 @@ def main(argv=None):
     p.add_argument('--sysfs-root', default='/sys',
                    help='where sysfs is mounted (for testing)')
     p.add_argument('--no-perf', action='store_true', help='do not run perf list')
+    p.add_argument('--perf-json', metavar='FILE',
+                   help='read `perf list -j` output saved in FILE instead of running perf')
+    p.add_argument('--include', metavar='REGEX',
+                   help='also write every event whose name matches REGEX, under its '
+                        'own name: measured, not modelled -- for exploring a core '
+                        "(on K1: 'l2_a[rw]_channel|lsu|vlsu|l1d_(prefetch|excl|amr)')")
     p.add_argument('--no-verify', action='store_true',
                    help='do not open the picked events to check the kernel takes them')
     p.add_argument('--cpuinfo', default='/proc/cpuinfo', help=argparse.SUPPRESS)
@@ -547,19 +605,20 @@ def main(argv=None):
 
     pmus = sysfs_pmus(a.sysfs_root)
     perf_events, listed, perf_status = (([], None, 'skipped') if a.no_perf
-                                        else perf_list_events())
+                                        else perf_list_events(a.perf_json))
     table, skipped = candidates(pmus, perf_events)
     listed_pmus = ', '.join('%s (type %d)' % (k, v['type']) for k, v in pmus.items())
     print(f"# PMUs: {listed_pmus or 'none'}")
     print(f"# events: {len(table)} encodable"
           + (f", {len(perf_events)} from perf list" if perf_events else
              ", perf lists no named events here" if perf_status == 'ok' else
-             ", this perf has no 'perf list -j' (older than 6.x): sysfs only"
+             ", perf's list could not be read (no 'perf list -j' before 6.x, "
+             "or output that is not JSON): sysfs only"
              if perf_status == 'old' else
              ", perf not available" if perf_status == 'missing' else "")
           + (f"; {skipped} skipped as not one concrete event (term ranges, '?' "
              f"parameters, or values or terms the PMU cannot take)" if skipped else ""))
-    for h in hints(pmus, perf_events, cpuinfo(a.cpuinfo)):
+    for h in hints(pmus, perf_events, cpuinfo(a.cpuinfo), perf_status):
         print(f"# note: {h}")
 
     if a.list:
@@ -587,6 +646,23 @@ def main(argv=None):
             print(f"  {canon:<22} not found")
         for r in rejected.get(canon, []):
             print(f"  {'':<22}   passed over {r}")
+    if a.include:
+        # exploration: every matching event under its own name, measured only
+        pat, have, extra = re.compile(a.include, re.I), {p[0] for p in chosen.values() if p}, {}
+        for name in sorted(table):
+            spec, where = table[name]
+            if not pat.search(name) or spec in have or name.upper() in chosen:
+                continue
+            why = check(spec, False) if check else None
+            if why:
+                print(f"  {name.upper():<22} passed over {spec}: {why}")
+                continue
+            extra[name.upper()] = (spec, where, '')
+            have.add(spec)
+        print(f"# included by --include: {len(extra)}, measured only")
+        for canon, (spec, where, _) in extra.items():
+            print(f"  {canon:<30} {spec:<14} {where}")
+        chosen.update(extra)
     if a.write:
         with open(a.write + '.txt', 'w') as f:
             for canon, pick in chosen.items():
