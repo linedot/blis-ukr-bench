@@ -1225,17 +1225,41 @@ def _burst_timeliness(an : analysis, ev : prefetch_eval,
     return sum(hidden(i) for i in idx) / len(idx)
 
 
+def _seg_factor(w : float, line : int) -> float:
+    """
+    Lines moved per byte held, for contiguous segments of w bytes.  A segment
+    touches every line it overlaps; successive ones -- the rows of tiles
+    along C -- sit at offsets that are multiples of g = gcd(w, line), and
+    over those it touches (w + line - g) / line lines on average.  A 48-byte
+    row (8x6 dgemm, row-major C) touches 1.5 64-byte lines: twice its bytes;
+    a 192-byte one (8x24) exactly 3.  Assumes the rows of C start
+    line-aligned, as with an aligned C and ld a multiple of the line.
+
+    :param w: segment bytes
+    :param line: line bytes
+    :return: >= 1
+    """
+    w, line = int(round(w)), int(line)
+    if w <= 0 or line <= 0:
+        return 1.0
+    return (w + line - math.gcd(w, line)) / w
+
+
 def prefetch_instance(u : ukernel, b : blocking, p : problem,
-                      sp : sw_prefetch) -> float:
+                      sp : sw_prefetch, line : int=0,
+                      c_layout : str='rm') -> float:
     """
     Bytes one prefetch fetches: what the next iteration of its loop needs of
     its operand.  For loop 'k' this is also the window of lines it keeps in
-    flight ahead of use.
+    flight ahead of use.  Given the line, C counts the lines its rows (or
+    columns) touch, not its bytes -- see _seg_factor.
 
     :param u: microkernel model
     :param b: blocksizes
     :param p: problem sizes
     :param sp: the prefetch
+    :param line: line bytes at the target, 0 for plain bytes
+    :param c_layout: 'rm' or 'cm', for C
     :return: bytes in one prefetched instance
     """
     t = make_loop_nest(b, p)
@@ -1248,7 +1272,13 @@ def prefetch_instance(u : ukernel, b : blocking, p : problem,
              ('pc', 'A'): p.m * t.k_c,   ('pc', 'B'): t.k_c * t.n_c,
              ('jc', 'B'): p.k * t.n_c,   ('jc', 'C'): p.m * t.n_c,
              }[(sp.loop, sp.operand)]
-    return elems * u.size(sp.operand)
+    nbytes = elems * u.size(sp.operand)
+    if sp.operand == 'C' and line:
+        # the instance's segments: rows (row-major) or columns of it
+        seg = ({'ir': u.n_r, 'jr': u.n_r, 'ic': t.n_c, 'jc': t.n_c} if c_layout == 'rm'
+               else {'ir': u.m_r, 'jr': t.m_c, 'ic': t.m_c, 'jc': p.m})[sp.loop]
+        nbytes *= _seg_factor(seg * u.size('C'), line)
+    return nbytes
 
 
 def evaluate_prefetch(an : analysis, sp : sw_prefetch) -> prefetch_eval:
@@ -1287,7 +1317,8 @@ def evaluate_prefetch(an : analysis, sp : sw_prefetch) -> prefetch_eval:
     L = bds[t].level
     strm = an.strm.get(L.name, {})
     ev.target_index = t
-    ev.instance = prefetch_instance(an.kernel, an.blocks, an.sizes, sp)
+    ev.instance = prefetch_instance(an.kernel, an.blocks, an.sizes, sp,
+                                    L.line, an.c_layout)
     ev.lead = loop_lead(an, sp)
     ev.relieves = ['core'] + [bds[i].level.name for i in range(t)]
 
@@ -1562,7 +1593,8 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
         L = next((L for L in levels if L.name == sp.target), None)
         if (sp.hint == 'strm' and L is not None and L.assoc
                 and sp.loop in LOOPS and sp.operand in VARYING[sp.loop]):
-            ways = max(1, -(-prefetch_instance(u, b, p, sp) // L.way))
+            ways = max(1, -(-prefetch_instance(u, b, p, sp, L.line, c_layout)
+                            // L.way))
             strm[L.name][sp.operand] = max(strm[L.name].get(sp.operand, 0),
                                            int(ways))
 
@@ -1595,6 +1627,16 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
             rd[op] = 0.0
         pk_rd, pk_wr = _pack_crossing(tr, resident,
                                       t.n_jc if 'jc' in held else 1)
+        # C moves in lines, not bytes: each row of a tile (column, if C is
+        # column-major) touches the lines it overlaps -- and the line it
+        # shares with the next tile along the row moves again, unless the C
+        # strip stays inside this boundary until the next jr iteration,
+        # which is what 'jr' being held means
+        if li and 'jr' not in held:
+            fc = _seg_factor((u.n_r if c_layout == 'rm' else u.m_r) * u.size('C'),
+                             req.line)
+            rd['C'] = rd.get('C', 0.0) * fc
+            wr['C'] = wr.get('C', 0.0) * fc
         # A store that misses pulls the line in first, unless C is read anyway.
         # That fetch is issued by the cache, not the core, so it never crosses
         # the innermost boundary.
@@ -2514,6 +2556,17 @@ def counters(an : analysis, vl : int=64) -> pmu_prediction:
             if _core_cache(name):
                 key = f'{name}D_MISS_OCCUPANCY'
                 ev[key] = ev.get(key, 0.0) + an.calls * wait
+    # a software prefetch into an outer level is an access there of its own:
+    # every one it issues looks the line up in its target, hit or miss
+    for e in an.evals:
+        ti = getattr(e, 'target_index', None)
+        if ti and e.coverage is not None and e.instr_per_kstep:
+            name = bds[ti].level.name
+            if _core_cache(name):
+                n = e.instr_per_kstep * ks_all
+                for key in (f'{name}D_CACHE', f'{name}D_CACHE_RD'):
+                    if key in ev:
+                        ev[key] += n
     ksteps = p.m * p.n * p.k / (u.m_r * u.n_r)
     return pmu_prediction(ev, ksteps, an.calls, pred)
 
@@ -3064,6 +3117,33 @@ def selftest() -> int:
         pq.m * pq.n * u8.size('C'))
     edge = analyse(u8, blocking(64, 64, 20), problem(64, 20, 64), lv, free)
     chk("n = 20, n_r = 8: 3 column tiles, not 2.5", edge.calls, 8 * 3)
+
+    print("\nC moves in lines: a tile row touches every line it overlaps")
+    chk("48-byte rows at 64-byte lines: 1.5 lines, twice the bytes",
+        _seg_factor(48, 64), 2.0)
+    chk("... at 128-byte lines: 1.25 lines", _seg_factor(48, 128), 1.25 * 128 / 48)
+    chk("192-byte rows are three whole lines", _seg_factor(192, 64), 1.0)
+    u86 = ukernel(8, 6, 8, 4.0, 4.0, 3, True)
+    lv86 = parse_hierarchy('64K:64::-1::10:7;512K:64::-1::20:8;INF:::-1:::200')
+    big, pq = blocking(400, 800, 4096), problem(4000, 4000, 400)   # A_c 2.5 MB
+    by = {cl: analyse(u86, big, pq, lv86, free, c_layout=cl).boundaries[1].rd['C']
+          for cl in ('rm', 'cm')}
+    chk("8x6, row-major: twice the C lines of column-major (64-byte columns)",
+        by['rm'], 2 * by['cm'])
+    sm, pq2 = blocking(64, 32, 4096), problem(4000, 4000, 64)       # A_c 16 KB
+    by = {cl: analyse(u86, sm, pq2, lv86, free, c_layout=cl).boundaries[1].rd['C']
+          for cl in ('rm', 'cm')}
+    chk("... the same, once the strip stays in L1 for the next jr", by['rm'], by['cm'])
+    pf2 = analyse(u86, sm, pq2, lv86, free, c_layout='rm',
+                  sw=[parse_prefetch('ir:C:L2')])
+    e0 = counters(analyse(u86, sm, pq2, lv86, free, c_layout='rm')).events
+    e2 = counters(pf2).events
+    chk("a prefetch into L2 is an L2 read of its own: + its lines",
+        e2['L2D_CACHE_RD'] - e0['L2D_CACHE_RD'],
+        pf2.evals[0].instr_per_kstep * pq2.m * pq2.n * pq2.k / (8 * 6))
+    chk("a C prefetch covers the lines: 8 rows x 1.5 lines x 64 bytes",
+        prefetch_instance(u86, big, pq, sw_prefetch('ir', 'C', 'L2'), 64, 'rm'),
+        8 * 1.5 * 64)
 
     print("\na victim level writes back every line it was filled with")
     vp = '32K:64::-1::16:5:{v};1M:64::-1::32:18:{v};8M:64::-1::32:40:{w};INF:::-1:::150'

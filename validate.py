@@ -62,9 +62,13 @@ RUNGS = ['ukr', 'ir', 'jr', 'ic', 'pc', 'jc', 'pre']
 EPI_FLOPS = {'general': 3, 'one': 2, 'zero': 1}
 
 
+PIN = []          # --cpu N for goto_bench, from --cpu
+
+
 def run_bench(bench, args):
     """Run goto_bench, return (metadata, row)."""
-    out = subprocess.run([bench] + [str(a) for a in args], capture_output=True, text=True)
+    out = subprocess.run([bench] + [str(a) for a in args] + PIN, capture_output=True,
+                         text=True)
     if out.returncode != 0:
         raise RuntimeError(f"goto_bench {' '.join(map(str, args))} failed:\n{out.stderr}{out.stdout}")
     meta, lines = {}, []
@@ -473,6 +477,10 @@ def main(argv=None):
         s.add_argument('--beta', default='general', choices=list(EPI_FLOPS))
         s.add_argument('--min-time', type=float, default=0.3)
         s.add_argument('--extra', nargs='*', default=[], help='more goto_bench options, e.g. --cpu 2')
+        s.add_argument('--cpu', type=int,
+                       help="pin goto_bench to this CPU (on a desktop, keep its SMT "
+                            "sibling idle; on a server, avoid the CPU that takes the "
+                            "interrupts, often 0)")
     c = sub.choices['calibrate']
     c.add_argument('-o', '--output', default='calib.json')
     c.add_argument('--prefetch', nargs='*', default=[],
@@ -538,6 +546,8 @@ def main(argv=None):
                    help='model regions below jc against the full hierarchy')
     r.add_argument('-o', '--output')
     a = p.parse_args(argv)
+    global PIN
+    PIN = ['--cpu', str(a.cpu)] if getattr(a, 'cpu', None) is not None else []
     return {'detect-cache': cmd_detect_cache, 'calibrate': cmd_calibrate, 'run': cmd_run}[a.cmd](a)
 
 

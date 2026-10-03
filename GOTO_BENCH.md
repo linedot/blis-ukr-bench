@@ -191,6 +191,21 @@ the epilogue's wait for C (`model.py --call-extra`): a call costs the larger.
 a miss from the level above -- not load-to-use totals: with totals of 7, 14
 and 46 cycles for L1, L2 and L3 hits, the spec says 7, 7 and 32.
 
+C moves in lines, not bytes. Each row of a tile (column, for column-major C)
+touches every line it overlaps: an 8x6 dgemm tile's 48-byte rows touch 1.5
+64-byte lines on average, twice their bytes, while an 8x24 tile's 192-byte
+rows are three whole lines. That matters for FMA kernels whose vectors are
+narrower than a line -- NEON, 128-bit RVV. Neighbouring tiles share the line
+between them, so the extra traffic crosses a boundary only where the C strip
+does not stay inside it until the next jr iteration, i.e. where the jr rung
+is not held. The model assumes C's rows start line-aligned. A software
+prefetch into an outer level also counts as an access there of its own:
+`ir:C:L2` adds its lines to `L2D_CACHE_RD`.
+
+`--cpu N` pins goto_bench, for `calibrate` and `run` alike. On a desktop keep
+the CPU's SMT sibling idle; on a server avoid the CPU that takes most
+interrupts, often 0.
+
 A trailing `:v` on a level marks it as one whose evictions all go to the next
 level, clean lines too -- the next is exclusive of it, or a victim cache. Its
 write-backs are then every line it was filled with, not just the dirty ones:
