@@ -204,6 +204,12 @@ C, this term usually binds, and its two unknowns separate on the counters: the
 mean L1 miss latency (`L1D_MISS_OCCUPANCY / L1D_CACHE_REFILL`) gives the
 latency, and the time per call then gives the waves, i.e. the buffer count.
 
+Whether a software prefetch into an outer level also holds the inner levels'
+fill buffers until it lands is implementation-dependent. The model assumes it
+does not; `--sw-pf-holds-inner` says it does. On Zen 5, `PREFETCHT1` (what
+`ir:C:L2` issues) does: with it, measured L1 miss occupancy matches the model
+only with the switch set. It changes occupancy, not the epilogue's wait.
+
 The residency test charges each streamer what one iteration of the loop
 touches: for `jr` the whole C strip (m_c x n_r), for `ic` the whole C block
 (m_c x n_c), because under LRU every line of it competes with the invariant

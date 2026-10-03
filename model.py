@@ -55,7 +55,14 @@ that is paid in series with them:
               ones without allocating, which is why it can relieve them.
               That is implementation-dependent -- if the core tracks such a
               prefetch in an inner fill buffer until it lands, the relief is
-              not there.
+              not there (--sw-pf-holds-inner: Zen 5's PREFETCHT1, by its L1
+              miss-occupancy counter).  The epilogue's wait is relieved
+              either way: the line is in the outer level in time.
+
+              These are average-rate bounds.  A burst -- the C tile, all
+              requested at the epilogue -- needs all its slots at once, so it
+              can take several round trips where the average rate fits
+              easily; see EXPOSURE.
 
   COMPUTE     FLOP / peak, plus the packing kernel's element rate.
 
@@ -716,6 +723,8 @@ class analysis:
     evals: list[prefetch_eval] = field(default_factory=list)
     pf_cover: dict[str, dict[str, float]] = field(default_factory=dict)
     lookahead: float = 0.0
+    pf_pass: dict[str, dict[str, float]] = field(default_factory=dict)
+    pf_hold_inner: bool = False
 
     @property
     def nest(self) -> loop_nest:
@@ -1429,17 +1438,22 @@ def _apply_prefetch(an : analysis):
                 bds[j].waste[t] = bds[j].waste.get(t, 0.0) + base[j][op]
                 ev.wasted += base[j][op]
 
-    cover = {}
+    # cover: what reaches each target in time; passing: the part of it that
+    # also bypasses the buffers of the levels inside the target -- all of it,
+    # unless software prefetches are tracked there until they land
+    cover, passing = {}, {}
     if an.pf.level:
         for op, c in an.cov.items():
             if c > 0:
                 cover.setdefault(op, {})[an.pf.level] = c
+                passing.setdefault(op, {})[an.pf.level] = c
     for ev in an.evals:
         if ev.coverage > 0:
-            per = cover.setdefault(ev.pf.operand, {})
-            prev = per.get(ev.pf.target, 0.0)
-            per[ev.pf.target] = 1 - (1 - prev) * (1 - ev.coverage)
-    an.pf_cover = cover
+            for d in (cover,) if an.pf_hold_inner else (cover, passing):
+                per = d.setdefault(ev.pf.operand, {})
+                prev = per.get(ev.pf.target, 0.0)
+                per[ev.pf.target] = 1 - (1 - prev) * (1 - ev.coverage)
+    an.pf_cover, an.pf_pass = cover, passing
 
 
 def _kept(an : analysis, op : str, holder : int, j : int,
@@ -1460,7 +1474,10 @@ def _kept(an : analysis, op : str, holder : int, j : int,
     :return: remaining fraction, 1.0 if nothing applies
     """
     kept = 1.0
-    for target, c in an.pf_cover.get(op, {}).items():
+    # the core is relieved whenever the line is there in time; a cache level's
+    # buffers only if the prefetch bypassed them (see --sw-pf-holds-inner)
+    src = an.pf_cover if holder < 0 else an.pf_pass
+    for target, c in src.get(op, {}).items():
         if holder < idx[target] < j:
             kept *= 1 - c
     return kept
@@ -1487,7 +1504,8 @@ def _pack_crossing(tr : traffic, resident : set[str],
 def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
             pk : packing=None, write_allocate : bool=True, core_mshr : int=0,
             pf : hw_prefetcher=None, c_layout : str='rm',
-            sw : list[sw_prefetch]=None, lookahead : float=0.0) -> analysis:
+            sw : list[sw_prefetch]=None, lookahead : float=0.0,
+            pf_hold_inner : bool=False) -> analysis:
     """
     Traffic crossing every boundary, bottom up.  Boundary i sits between
     level i and level i-1 (the core for i=0).  What crosses it is worked out
@@ -1596,7 +1614,7 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
                   boundaries=bounds, c_layout=c_layout, streams=shape,
                   cov=coverage(shape, pf), pack_elems=w, flops=flops,
                   calls=calls, t_ukr=t_ukr, t_pack=t_pack, sw=sw, strm=strm,
-                  lookahead=lookahead)
+                  lookahead=lookahead, pf_hold_inner=pf_hold_inner)
     # the latency effect needs the traffic, so it comes last
     an.evals = [evaluate_prefetch(an, sp) for sp in sw]
     _apply_prefetch(an)
@@ -1688,7 +1706,7 @@ def _c_burst(an : analysis) -> dict:
              long a line holds a slot of that pool
     """
     out = dict(exposed=0.0, lines=0.0, waves=0, lat=0.0, queued=0.0,
-               pool=None, slot=0.0)
+               pool=None, slot=0.0, size=0)
     bds = an.boundaries
     c1 = bds[1].rd.get('C', 0.0) if len(bds) > 1 else 0.0
     if c1 <= 0 or not an.calls:
@@ -1712,7 +1730,8 @@ def _c_burst(an : analysis) -> dict:
     slot = (sum(v * bds[j].level.lat for j, v in left.items() if j > pool)
             / c1 if pool is not None else 0.0)
     out.update(exposed=max(0.0, waves * lat - an.lookahead), waves=waves,
-               lat=lat, queued=n * left[1] / c1, pool=pool, slot=slot)
+               lat=lat, queued=n * left[1] / c1, pool=pool, slot=slot,
+               size=m)
     return out
 
 
@@ -2130,7 +2149,7 @@ def _rerun(an : analysis, sw : list[sw_prefetch]=None,
     return analyse(an.kernel, blocks or an.blocks, an.sizes,
                    [bd.level for bd in an.boundaries], an.pk,
                    an.write_allocate, an.core.mshr, an.pf, an.c_layout,
-                   an.sw if sw is None else sw, an.lookahead)
+                   an.sw if sw is None else sw, an.lookahead, an.pf_hold_inner)
 
 
 def report_prefetch(an : analysis, pred : prediction):
@@ -2193,7 +2212,8 @@ def report_prefetch(an : analysis, pred : prediction):
 def report(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
            pk : packing=None, wa : bool=True, core_mshr : int=0,
            pf : hw_prefetcher=None, c_layout : str='rm',
-           sw : list[sw_prefetch]=None, lookahead : float=0.0) -> analysis:
+           sw : list[sw_prefetch]=None, lookahead : float=0.0,
+           pf_hold_inner : bool=False) -> analysis:
     """
     Analyse one configuration and print the full breakdown: traffic per
     boundary, stream shapes, the two phases, buffer occupancy, software
@@ -2212,7 +2232,8 @@ def report(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
     :param sw: software prefetches
     :return: the analysis, so that --counters can reuse it
     """
-    an = analyse(u, b, p, levels, pk, wa, core_mshr, pf, c_layout, sw, lookahead)
+    an = analyse(u, b, p, levels, pk, wa, core_mshr, pf, c_layout, sw, lookahead,
+                 pf_hold_inner)
     pred = predict(an)
     pk, G = an.pk, 2 ** 30
     print(f"micro-kernel {u.m_r}x{u.n_r}  s={_fmt_sizes(u)}  peak={u.peak} FLOP/cy  "
@@ -2426,7 +2447,8 @@ def counters(an : analysis, vl : int=64) -> pmu_prediction:
     # latencies above leave out
     cb = _c_burst(an)
     if cb['queued'] and cb['pool'] is not None and cb['pool'] > 0:
-        m = cb['queued'] / cb['waves'] if cb['waves'] else cb['queued']
+        # the pool takes its size at once; line i waits floor(i / size) slots
+        m = cb['size']
         k = math.ceil(cb['queued'] - 1e-9)
         wait = sum(int(i // m) for i in range(k)) * cb['slot'] if m else 0.0
         for i in range(cb['pool']):
@@ -3001,6 +3023,16 @@ def selftest() -> int:
     to_l1 = analyse(u, b, p, lv, free, sw=[parse_prefetch('ir:C:L1')])
     chk("prefetched into L1: nothing exposed", c_exposure(to_l1)[0], 0)
 
+    print("\na software prefetch can hold the inner buffers until it lands")
+    held = analyse(u, b, p, lv, free, sw=[parse_prefetch('ir:C:L2')],
+                   pf_hold_inner=True)
+    l1 = lambda a: sum(r for ph in ('ukr', 'pack')
+                       for nm, _, r, _ in _buffer_cycles(a, ph) if nm == 'L1')
+    chk("held: the epilogue still waits only for L2 (18)", c_exposure(held)[0], 18)
+    chk("... but L1's buffers carry the whole trip, as with no prefetch",
+        l1(held), l1(an))
+    chk("not held: L1's buffers are relieved", float(l1(to_l2) < l1(an)), 1.0)
+
     print("\na burst's later waves wait in the buffers inside the limit")
     ev = counters(an).events          # L2 has 4 buffers: 8 lines, 2 waves
     base = sum(r for nm, _, r, _ in _buffer_cycles(an, 'ukr') if nm == 'L1') \
@@ -3125,6 +3157,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="operands the k-loop loads as broadcasts, one load per "
                          "element: A for AOCL's 8x24 dgemm kernel.  Only the "
                          "L1D_CACHE uop counts depend on it.")
+    ap.add_argument('--sw-pf-holds-inner', action='store_true',
+                    help="a software prefetch into an outer level is tracked in "
+                         "the inner levels' fill buffers until it lands, so it "
+                         "relieves the core's queue and the epilogue's wait but "
+                         "not those buffers.  Zen 5's PREFETCHT1 behaves so by "
+                         "its L1 miss-occupancy counter.")
     ap.add_argument('--call-uops', default='0', metavar='LD[/ST]',
                     help="memory uops per call outside the k-loop and the C "
                          "tile: arguments read from memory, saved registers, "
@@ -3253,7 +3291,7 @@ def main(argv : list[str]=None) -> int:
               a.sweep)
     else:
         an = report(u, b, p, lv, pk, wa, a.core_mshr, pf, a.c_layout, sw,
-                    a.lookahead)
+                    a.lookahead, a.sw_pf_holds_inner)
         if a.counters:
             report_counters(an, a.vl)
     return 0

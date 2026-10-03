@@ -272,7 +272,7 @@ def cmd_run(a):
         sw += kernel_prefetches(a.kernel_prefetch, kc)
         hw = model.hw_prefetcher(a.pf_streams, a.pf_min_run, a.pf_level.upper())
         an = model.analyse(u, b, p, lv, pk, True, a.core_mshr, hw,
-                           a.c_layout, sw, a.lookahead)
+                           a.c_layout, sw, a.lookahead, a.sw_pf_holds_inner)
         pred = model.predict(an)
         fm, fp = work / meas, work / pred.time
         res = {'top': top, 'm': me, 'n': ne, 'k': ke, 'kc': kc, 'mc': mc, 'nc': nc,
@@ -374,6 +374,10 @@ def main(argv=None):
     r.add_argument('--bcast', default='', metavar='OPERANDS',
                    help="operands the kernel's k-loop loads as broadcasts (A for "
                         "AOCL's 8x24 dgemm kernel), for the L1D_CACHE uop counts")
+    r.add_argument('--sw-pf-holds-inner', action='store_true',
+                   help="software prefetches into an outer level hold the inner "
+                        "levels' fill buffers until they land, as model.py "
+                        "(Zen 5's PREFETCHT1 does)")
     r.add_argument('--call-uops', default='0', metavar='LD[/ST]',
                    help="memory uops per call outside the k-loop and the C tile, "
                         "as model.py --call-uops (AOCL's 8x24 kernel in goto_bench "
