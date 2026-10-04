@@ -161,14 +161,16 @@ where a column flattens is the distance needed.
 `--copy` packs instead, the way BLIS packs A: 8-row panels of a column-major
 matrix, one 64-byte line per column, four columns per iteration, loaded then
 stored -- with vector loads (`vle64` at LMUL 2, VLEN >= 256) and with scalar
-`ld`/`sd`, each with the prefetch D columns ahead (D = 0: none). The chase has
-one miss in flight and scalar loads; packing has four, vector loads and stores.
+`ld`/`sd`, each with the prefetch D columns ahead in packing order -- past a
+panel's last column, into the next panel's, as a kernel prefetching across
+panels would (D = 0: none). The chase has one miss in flight and scalar loads;
+packing has four, vector loads and stores.
 
 | option | |
 |---|---|
 | `--pf KINDS` | prefetches to compare (default `l1,l2,load`; `--copy`: `l1`) |
 | `--dist LIST` | D values: numbers and ranges `a-b` or `a-b:step` (default `1,2,4,8,16,32,64`; `--copy`: `0,4,8,16,32`) |
-| `--cols N` | `--copy`: columns per panel, a k_c (240) |
+| `--cols N` | `--copy`: columns per panel, a k_c (240); groups of four, leftovers one at a time |
 | `--flavor F` | `--copy`: `vector`, `scalar` or `both` |
 | `--reps N` | fixed repetitions instead of `--min-time`, and the lines or columns each configuration touches: wrap one configuration in `perf stat` and count per line |
 | `--huge` | transparent huge pages for the buffer, reporting how much the process holds in them (`/sys/kernel/mm/transparent_hugepage/enabled` must allow `madvise`) |

@@ -35,7 +35,8 @@
 //                 a-b:step (default 1,2,4,8,16,32,64; --copy: 0,4,8,16,32,
 //                 where 0 is no prefetch)
 //   --copy        pack like BLIS packs A instead of the pointer chase
-//   --cols N      --copy: columns per panel, a k_c; a multiple of 4 (240)
+//   --cols N      --copy: columns per panel, a k_c (240); in groups of four,
+//                 any left over one at a time
 //   --flavor F    --copy: vector, scalar or both (both)
 //   --reps N      fixed repetitions instead of --min-time, so that perf stat
 //                 around one configuration counts known work; prints how many
@@ -221,14 +222,61 @@ void walk(const std::size_t* buf, const std::size_t* order, std::size_t n, std::
                      : "memory" VCLOBBER)
 #endif
 
-// columns c..c+3 of one 8-row panel (a 64-byte line each, lda bytes apart) to
-// the packed panel, loads first, each followed by kind K's prefetch `ahead`
-// bytes further (the same column D ahead)
+#if defined(__riscv)
+#define VEC_COPY1(PFS)                                                                    \
+    __asm__ volatile(".option push\n\t.option arch, +v\n\t"                               \
+                     "vsetivli zero, 8, e64, m2, ta, ma\n\t"                              \
+                     "vle64.v v8, (%[s0])\n\t" PFS("%[p0]")                               \
+                     "vse64.v v8, (%[d0])\n\t"                                            \
+                     ".option pop"                                                        \
+                     :: [s0] "r"(s), [p0] "r"(p), [d0] "r"(d)                             \
+                     : "memory" VCLOBBER)
+#endif
+
+// one column of an 8-row panel (a 64-byte line) to the packed panel, the load
+// followed by kind K's prefetch of p: for a panel's columns left over after
+// the groups of four
 template <kind K, bool vec>
-inline void copy4(const char* s, std::size_t lda, std::size_t ahead, double* d)
+inline void copy1(const char* s, const char* p, double* d)
+{
+#if defined(__riscv)
+    if constexpr (vec)
+    {
+        if constexpr (K == none) VEC_COPY1(PFS_none);
+        if constexpr (K == pf_l1) VEC_COPY1(PFS_l1);
+        if constexpr (K == pf_l2) VEC_COPY1(PFS_l2);
+        if constexpr (K == pf_l3) VEC_COPY1(PFS_l3);
+        if constexpr (K == pf_nta) VEC_COPY1(PFS_nta);
+        if constexpr (K == pf_w) VEC_COPY1(PFS_w);
+        if constexpr (K == load) VEC_COPY1(PFS_load);
+    }
+    else
+    {
+        touch<K>(p);
+        __asm__ volatile("ld t0, 0(%[s])\n\t"  "ld t1, 8(%[s])\n\t"  "ld t2, 16(%[s])\n\t"
+                         "ld t3, 24(%[s])\n\t" "ld t4, 32(%[s])\n\t" "ld t5, 40(%[s])\n\t"
+                         "ld t6, 48(%[s])\n\t" "ld a7, 56(%[s])\n\t"
+                         "sd t0, 0(%[d])\n\t"  "sd t1, 8(%[d])\n\t"  "sd t2, 16(%[d])\n\t"
+                         "sd t3, 24(%[d])\n\t" "sd t4, 32(%[d])\n\t" "sd t5, 40(%[d])\n\t"
+                         "sd t6, 48(%[d])\n\t" "sd a7, 56(%[d])\n\t"
+                         :: [s] "r"(s), [d] "r"(d)
+                         : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a7", "memory");
+    }
+#else
+    touch<K>(p);
+    if constexpr (vec) std::memcpy(d, s, 64);
+    else
+        for (int w = 0; w < 8; w++) d[w] = reinterpret_cast<const volatile double*>(s)[w];
+#endif
+}
+
+// columns c..c+3 of one 8-row panel (a 64-byte line each, lda bytes apart) to
+// the packed panel, loads first, each followed by kind K's prefetch of pf[g]
+template <kind K, bool vec>
+inline void copy4(const char* s, std::size_t lda, const char* const* pf, double* d)
 {
     const char *s1 = s + lda, *s2 = s1 + lda, *s3 = s2 + lda;
-    const char *p0 = s + ahead, *p1 = s1 + ahead, *p2 = s2 + ahead, *p3 = s3 + ahead;
+    const char *p0 = pf[0], *p1 = pf[1], *p2 = pf[2], *p3 = pf[3];
 #if defined(__riscv)
     if constexpr (vec)
     {
@@ -273,18 +321,45 @@ inline void copy4(const char* s, std::size_t lda, std::size_t ahead, double* d)
 #endif
 }
 
-// every panel of a rows x cols matrix (lda = rows doubles), into one panel buffer
+// every panel of a rows x cols matrix (lda = rows doubles), into one panel
+// buffer. The prefetch aims `dist` columns further in packing order: past a
+// panel's last column it continues with the next panel's (8 rows down) --
+// tracked by a cursor, since a division per column would cost more than the
+// copy.
 template <kind K, bool vec>
 void pack_all(const double* a, std::size_t rows, std::size_t cols, std::size_t dist,
               double* panel, long reps)
 {
-    const std::size_t lda = rows * sizeof(double), ahead = dist * lda;
+    const std::size_t lda = rows * sizeof(double);
+    const char* const base = reinterpret_cast<const char*>(a);
+    const std::size_t panels_ahead = dist / cols, cols_ahead = dist % cols;
     for (long r = 0; r < reps; r++)
         for (std::size_t i = 0; i < rows; i += 8)
         {
-            const char* col = reinterpret_cast<const char*>(a + i);
-            for (std::size_t c = 0; c < cols; c += 4, col += 4 * lda)
-                copy4<K, vec>(col, lda, ahead, panel + 8 * c);
+            std::size_t prow = i + 8 * panels_ahead, pcol = cols_ahead;
+            const char* pf = base + prow * sizeof(double) + pcol * lda;
+            auto next = [&]() -> const char* {
+                const char* at = pf;
+                if (++pcol == cols)
+                {
+                    pcol = 0;
+                    prow += 8;
+                    pf = base + prow * sizeof(double);
+                }
+                else pf += lda;
+                return at;
+            };
+            const char* col = base + i * sizeof(double);
+            std::size_t c = 0;
+            for (; c + 4 <= cols; c += 4, col += 4 * lda)
+            {
+                const char* pfs[4] = {nullptr, nullptr, nullptr, nullptr};
+                if constexpr (K != none)
+                    for (auto& p : pfs) p = next();
+                copy4<K, vec>(col, lda, pfs, panel + 8 * c);
+            }
+            for (; c < cols; c++, col += lda)
+                copy1<K, vec>(col, K != none ? next() : nullptr, panel + 8 * c);
         }
 }
 
@@ -439,7 +514,7 @@ options parse(int argc, char** argv)
     o.kinds = parse_kinds(pf.empty() ? (o.copy ? "l1" : "l1,l2,load") : pf, argv[0]);
     o.dists = parse_dists(dist.empty() ? (o.copy ? "0,4,8,16,32" : "1,2,4,8,16,32,64") : dist,
                           argv[0]);
-    if (o.cols == 0 || o.cols % 4) usage(argv[0], "--cols must be a positive multiple of 4");
+    if (o.cols == 0) usage(argv[0], "--cols must be positive");
     return o;
 }
 
@@ -495,7 +570,7 @@ int copy_mode(const options& o, double scale, const char* unit)
     if (!vec && !o.scalar) return 0;
     std::printf("# --copy: 8-row panels of a column-major matrix, %zu columns, one 64-byte\n"
                 "# line per column, 4 columns per iteration; %s per column, prefetch D\n"
-                "# columns ahead (0: none)\n", cols, unit);
+                "# columns ahead in packing order (0: none)\n", cols, unit);
     for (const std::size_t kb : o.sizes_kb)
     {
         std::size_t rows = std::max<std::size_t>(8, kb * 1024 / sizeof(double) / cols / 8 * 8);
