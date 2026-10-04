@@ -76,9 +76,10 @@ Options
   cycle counter: one group with more events than the PMU has counters would
   never be scheduled. Each event is first opened on its own beside the cycle
   counter; one the kernel refuses is skipped with a warning naming it, so it
-  costs neither the rest of its group nor the cycles. A cycles-only pass comes
-  first, so a run takes 1 + ceil(events / N) passes, each `reps` measurements
-  of `inner` region runs; each event reports its own pass's minimum. A group
+  costs neither the rest of its group nor the cycles. A run takes
+  ceil(events / N) passes (one, the cycle counter alone, without events), each
+  `reps` measurements of `inner` region runs; each event reports its own
+  pass's minimum. A group
   the PMU cannot hold at once is reported as multiplexed. A group counts from
   when it is opened; each measurement reads it before and after the timed
   body, two read() system calls. What they cost the counts is measured around
@@ -89,7 +90,10 @@ Options
   cycle and instruction counters of RISC-V cores without Smcntrpmf count the
   kernel's part of each read, which inflated short regions' cycles by 3-9% on
   the SpacemiT K1 (a 1.6 GHz clock read as 1.65-1.75 GHz, while seconds-long
-  runs read 1.60).
+  runs read 1.60). There `u_mode_cycle` counts user-mode cycles only, which
+  `probe_events.py` picks for `CPU_CYCLES` and `validate.py` passes on as
+  `--cycles-event`: nothing of the kernel's to subtract, at the price of a
+  programmable counter in every group.
 * `--reps N` / `--min-time S`, `--warmup N`, `--inner N` -- `inner` repeats
   the region inside each timed measurement (default: enough for ~200 us), so
   small regions are not timer-bound. Every reported value is per region run.
@@ -235,8 +239,8 @@ ldc = 512 doubles, the 14 columns of an 8x14 tile fall in two set groups of a
 32 KB 4-way L1, seven lines per set, and evict each other on every call.
 
 `run --only EVENT...` measures a subset of `--events-map`: long runs pay one
-pass per group, so a full map of 36 events at `--group 4` runs each
-configuration ten times over.
+pass per group, so a full map of 35 events at `--group 4` runs each
+configuration nine times over.
 
 `run --per-kstep` splits cycles and every counter, per call, into a fixed part
 and a part per k-step, fitted per problem and region over runs that differ

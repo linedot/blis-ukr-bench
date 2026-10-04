@@ -53,7 +53,12 @@ import sys
 # kernel generic event, taken only where perf lists it as supported.  Names
 # checked against perf list on Kunpeng 920, AMD Zen 5 and SpacemiT K1 (X60).
 CANONICAL = {
-    'CPU_CYCLES': [('cpu_cycles', ''), ('cycles', ''), ('generic:CYCLES', '')],
+    'CPU_CYCLES': [
+        # SpacemiT X60: user-mode cycles only. Its fixed cycle counter cannot
+        # leave kernel and firmware time out (no Smcntrpmf), so every counter
+        # read's system call and every interrupt would land in the count
+        ('u_mode_cycle', 'user mode only, unlike the fixed cycle counter'),
+        ('cpu_cycles', ''), ('cycles', ''), ('generic:CYCLES', '')],
     'INST_RETIRED': [('inst_retired', ''), ('instructions', ''),
                      ('generic:INSTRUCTIONS', '')],
     # memory uops: loads + stores, and each part

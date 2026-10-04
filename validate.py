@@ -65,11 +65,12 @@ EPI_FLOPS = {'general': 3, 'one': 2, 'zero': 1}
 
 
 PIN = []          # --cpu N for goto_bench, from --cpu
+CYC = []          # --cycles-event E for goto_bench, from --cycles-event or the map
 
 
 def run_bench(bench, args):
     """Run goto_bench, return (metadata, row)."""
-    out = subprocess.run([bench] + [str(a) for a in args] + PIN, capture_output=True,
+    out = subprocess.run([bench] + [str(a) for a in args] + PIN + CYC, capture_output=True,
                          text=True)
     if out.returncode != 0:
         raise RuntimeError(f"goto_bench {' '.join(map(str, args))} failed:\n{out.stderr}{out.stdout}")
@@ -80,7 +81,9 @@ def run_bench(bench, args):
             meta[k.strip()] = v.strip()
         elif line.strip():
             lines.append(line)
-    rows = list(csv.DictReader(lines))
+    # the CSV starts at its header: a backend may print other lines to stdout
+    head = next((i for i, l in enumerate(lines) if l.startswith('label,')), 0)
+    rows = list(csv.DictReader(lines[head:]))
     for w in out.stderr.splitlines():
         if 'warning' in w and w not in _seen_warnings:
             _seen_warnings.add(w)
@@ -636,6 +639,10 @@ def main(argv=None):
                        help="pin goto_bench to this CPU (on a desktop, keep its SMT "
                             "sibling idle; on a server, avoid the CPU that takes the "
                             "interrupts, often 0)")
+        s.add_argument('--cycles-event', metavar='E',
+                       help="goto_bench's cycle counter, which leads every counter "
+                            "group (default: CPU_CYCLES of --events-map, else CYCLES); "
+                            "on the SpacemiT X60, u_mode_cycle leaves kernel time out")
         s.add_argument('--c-layout', default='rm', choices=['rm', 'cm'],
                        help="C's layout: a kernel given the one it does not prefer may "
                             "move C element by element (goto_bench prints the "
@@ -703,8 +710,9 @@ def main(argv=None):
                         "64 for SME or AVX-512, 32 for AVX2 or 256-bit RVV, 16 for NEON")
     r.add_argument('--events-map', help='events.json from probe_events.py')
     r.add_argument('--group', type=int, default=4,
-                   help='events per counter group; each group is its own pass over '
-                        'the region, so passes = 1 + ceil(events / GROUP)')
+                   help='events per counter group; each group, led by the cycle '
+                        'counter, is its own pass over the region: '
+                        'ceil(events / GROUP) passes')
     r.add_argument('--only', nargs='+', metavar='EVENT',
                    help='measure only these events of --events-map: fewer passes '
                         'for long runs')
@@ -715,8 +723,13 @@ def main(argv=None):
                         'per-k-step part, fitted over runs that differ only in k_c')
     r.add_argument('-o', '--output')
     a = p.parse_args(argv)
-    global PIN
+    global PIN, CYC
     PIN = ['--cpu', str(a.cpu)] if getattr(a, 'cpu', None) is not None else []
+    cyc = getattr(a, 'cycles_event', None)
+    if not cyc and getattr(a, 'events_map', None):
+        with open(a.events_map) as f:
+            cyc = json.load(f).get('CPU_CYCLES')
+    CYC = ['--cycles-event', cyc] if cyc else []
     if getattr(a, 'prefetch', None):
         a.prefetch = [norm_prefetch(s) for s in a.prefetch]
     return {'detect-cache': cmd_detect_cache, 'calibrate': cmd_calibrate, 'run': cmd_run}[a.cmd](a)
