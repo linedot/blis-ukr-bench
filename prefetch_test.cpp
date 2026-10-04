@@ -55,6 +55,9 @@
 //                 buffer, as BLIS packs, instead of one panel buffer reused
 //   --pf-dest D   --copy-b: prefetch.w the panel D lines ahead of the block
 //                 being written, once per line
+//   --b-gather    --copy-b: a panel row at a time instead -- its n_r elements
+//                 gathered by one strided vlse64 (LMUL 4), stored by one
+//                 contiguous vse64: the panel written in order, whole lines
 //   --reps N      fixed repetitions instead of --min-time, so that perf stat
 //                 around one configuration counts known work; prints how many
 //                 lines (chase) or columns (copy) each configuration touches
@@ -518,6 +521,59 @@ inline void b_block(const char* src, std::size_t ldb, std::size_t vl, long pfoff
 // column, once per line: with blocks shorter than a line it alternates every
 // block with -64, the line just read, as the BLIS x60 kernel does -- unless
 // `every_block`, the scheme that prefetched each line twice.
+// --b-gather: a panel row at a time -- its n_r elements gathered from the n_r
+// columns by one strided load (vlse64, stride ldb, LMUL 4), stored by one
+// contiguous vse64. The panel is then written in order, whole lines, instead
+// of 8-byte pieces a row apart; each source line still serves 8 rows.
+#if defined(__riscv_vector)
+#define VCLOBBER_G , "v8", "v9", "v10", "v11"
+#else
+#define VCLOBBER_G
+#endif
+
+// elements an LMUL-4 group holds at e64 (16 at VLEN 256)
+std::size_t gather_vlmax()
+{
+#if defined(__riscv)
+    std::size_t vl = 0;
+    __asm__ volatile(".option push\n\t.option arch, +v\n\t"
+                     "vsetvli %0, zero, e64, m4, ta, ma\n\t"
+                     ".option pop" : "=r"(vl));
+    return vl;
+#else
+    return 16;
+#endif
+}
+
+template <bool vec>
+inline void gather_row(const char* src, std::size_t ldb, std::size_t nr, double* dst,
+                       std::size_t vlmax)
+{
+#if defined(__riscv)
+    if constexpr (vec)
+    {
+        for (std::size_t done = 0; done < nr;)
+        {
+            const std::size_t n = std::min(nr - done, vlmax);
+            __asm__ volatile(".option push\n\t.option arch, +v\n\t"
+                             "vsetvli zero, %[n], e64, m4, ta, ma\n\t"
+                             "vlse64.v v8, (%[s]), %[ldb]\n\t"
+                             "vse64.v v8, (%[d])\n\t"
+                             ".option pop"
+                             :: [n] "r"(n), [s] "r"(src + done * ldb), [ldb] "r"(ldb),
+                                [d] "r"(dst + done)
+                             : "memory" VCLOBBER_G);
+            done += n;
+        }
+        return;
+    }
+#else
+    (void)vlmax;
+#endif
+    for (std::size_t j = 0; j < nr; j++)
+        dst[j] = reinterpret_cast<const volatile double*>(src + j * ldb)[0];
+}
+
 // With `fresh`, each panel goes to its own region of `panel` (panels x kc x
 // n_r doubles), as BLIS fills B_c; otherwise one panel buffer is reused, which
 // stays in L1 while it fits. With `dest_ahead` > 0, prefetch.w each line of the
@@ -525,8 +581,37 @@ inline void b_block(const char* src, std::size_t ldb, std::size_t vl, long pfoff
 template <kind K, int NR, bool vec>
 void pack_b_all(const double* b, std::size_t kc, std::size_t panels, std::size_t vl,
                 std::size_t dist, bool every_block, double* panel, long reps, bool fresh,
-                std::size_t dest_ahead)
+                std::size_t dest_ahead, bool gather, std::size_t gvlmax)
 {
+    if (gather)
+    {
+        // a row at a time; each column's source line serves 8 rows, so its
+        // prefetch -- `dist` lines on -- comes every 8th row: once per line
+        const std::size_t ldb = kc * sizeof(double), row_bytes = NR * sizeof(double);
+        const std::size_t ahead = dist * line, dest_off = dest_ahead * line;
+        for (long r = 0; r < reps; r++)
+            for (std::size_t q = 0; q < panels; q++)
+            {
+                const char* col0 = reinterpret_cast<const char*>(b + q * NR * kc);
+                double* dst = fresh ? panel + q * NR * kc : panel;
+                for (std::size_t p = 0; p < kc; p++)
+                {
+                    if constexpr (K != none)
+                        if ((p & 7) == 0)
+                            for (int j = 0; j < NR; j++)
+                                touch<K>(col0 + j * ldb + p * sizeof(double) + ahead);
+                    if (dest_ahead)
+                    {
+                        const auto start = reinterpret_cast<std::uintptr_t>(dst + p * NR) + dest_off;
+                        for (std::uintptr_t a = (start + line - 1) / line * line;
+                             a < start + row_bytes; a += line)
+                            touch<pf_w>(reinterpret_cast<const void*>(a));
+                    }
+                    gather_row<vec>(col0 + p * sizeof(double), ldb, NR, dst + p * NR, gvlmax);
+                }
+            }
+        return;
+    }
     const std::size_t ldb = kc * sizeof(double), block_bytes = vl * sizeof(double);
     const long ahead = static_cast<long>(dist * line);
     const bool alternate = !every_block && block_bytes < line;
@@ -556,15 +641,15 @@ void pack_b_all(const double* b, std::size_t kc, std::size_t panels, std::size_t
 template <kind K>
 void pack_b(bool vec, std::size_t nr, const double* b, std::size_t kc, std::size_t panels,
             std::size_t vl, std::size_t dist, bool every_block, double* panel, long reps,
-            bool fresh, std::size_t dest_ahead)
+            bool fresh, std::size_t dest_ahead, bool gather, std::size_t gvlmax)
 {
 #define PACK_B_NR(N)                                                                          \
     if (nr == N)                                                                              \
     {                                                                                         \
         if (vec) pack_b_all<K, N, true>(b, kc, panels, vl, dist, every_block, panel, reps,    \
-                                        fresh, dest_ahead);                                   \
+                                        fresh, dest_ahead, gather, gvlmax);                   \
         else pack_b_all<K, N, false>(b, kc, panels, vl, dist, every_block, panel, reps,       \
-                                     fresh, dest_ahead);                                      \
+                                     fresh, dest_ahead, gather, gvlmax);                      \
         return;                                                                               \
     }
     PACK_B_NR(4) PACK_B_NR(8) PACK_B_NR(14) PACK_B_NR(16)
@@ -592,7 +677,7 @@ struct options
     double ghz = 0, min_time = 0.1;
     long reps = 0;
     bool huge = false, copy = false, wrap = true, pair = false;
-    bool copy_b = false, every_block = false, dest_fresh = false;
+    bool copy_b = false, every_block = false, dest_fresh = false, gather = false;
     std::size_t dest_ahead = 0;
     std::size_t nr = 14;
     std::size_t cols = 240;
@@ -607,7 +692,8 @@ struct options
     std::fprintf(stderr,
                  "usage: %s [--pf l1,l2,l3,nta,w,load] [--dist LIST] [--copy] [--cols N]\n"
                  "       [--flavor vector|scalar|both] [--no-wrap] [--pf-pair] [--copy-b]\n"
-                 "       [--nr N] [--pf-every-block] [--dest-fresh] [--pf-dest D] [--reps N]\n"
+                 "       [--nr N] [--pf-every-block] [--dest-fresh] [--pf-dest D] [--b-gather]\n"
+                 "       [--reps N]\n"
                  "       [--huge] [--cpu N] [--ghz G] [--min-time S] [SIZE_KB...]\n", argv0);
     std::exit(1);
 }
@@ -700,6 +786,7 @@ options parse(int argc, char** argv)
         else if (a == "--pf-every-block") o.every_block = true;
         else if (a == "--dest-fresh") o.dest_fresh = true;
         else if (a == "--pf-dest") o.dest_ahead = number(value(), argv[0]);
+        else if (a == "--b-gather") o.gather = true;
         else if (a == "--pf-pair") o.pair = true;
         else if (a == "--cols") o.cols = number(value(), argv[0]);
         else if (a == "--pf") pf = value();
@@ -837,8 +924,13 @@ int copy_mode(const options& o, double scale, const char* unit)
 }
 int copy_b_mode(const options& o, double scale, const char* unit)
 {
-    const std::size_t kc = o.cols, nr = o.nr, vl = vector_rows();
-    if (kc % vl) usage("prefetch_test", "--cols must be a multiple of the vector length here");
+    const std::size_t kc = o.cols, nr = o.nr, vl = vector_rows(), gvlmax = gather_vlmax();
+    if (!o.gather && kc % vl)
+        usage("prefetch_test", "--cols must be a multiple of the vector length here");
+    if (o.gather)
+        std::printf("# --b-gather: a panel row at a time, gathered from the columns by one strided\n"
+                    "# vlse64 (LMUL 4, %zu elements a load) and stored by one contiguous vse64;\n"
+                    "# the source prefetch once per line, every 8th row\n", gvlmax);
     std::printf("# --copy-b: %zu-wide panels of a column-major %zu-row matrix (ldb %zu bytes),\n"
                 "# %zu rows a block, each column loaded then stored into the panel a row of\n"
                 "# %zu doubles apart; %s per source line, prefetch D lines on along each column\n"
@@ -862,7 +954,7 @@ int copy_b_mode(const options& o, double scale, const char* unit)
             if (d == 0) k = none;
             return ns_per_item([&](long reps) {
                 DISPATCH(k, pack_b, v, nr, b, kc, panels, vl, d, o.every_block, panel, reps,
-                         o.dest_fresh, o.dest_ahead)
+                         o.dest_fresh, o.dest_ahead, o.gather, gvlmax)
             }, items, o.min_time, o.reps) * scale;
         };
         const bool vec = o.vector;
