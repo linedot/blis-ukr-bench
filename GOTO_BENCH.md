@@ -171,6 +171,8 @@ packing has four, vector loads and stores.
 | `--pf KINDS` | prefetches to compare (default `l1,l2,load`; `--copy`: `l1`) |
 | `--dist LIST` | D values: numbers and ranges `a-b` or `a-b:step` (default `1,2,4,8,16,32,64`; `--copy`: `0,4,8,16,32`) |
 | `--cols N` | `--copy`: columns per panel, a k_c (240); groups of four, leftovers one at a time |
+| `--no-wrap` | `--copy`: aim D columns on in the same rows, past the panel's (and the matrix's) last column, as a kernel that knows only its own panel does |
+| `--pf-pair` | `--copy`: each prefetch twice, at +0 and +32 bytes, as BLIS's x60 A copy at LMUL 2 issues them |
 | `--flavor F` | `--copy`: `vector`, `scalar` or `both` |
 | `--reps N` | fixed repetitions instead of `--min-time`, and the lines or columns each configuration touches: wrap one configuration in `perf stat` and count per line |
 | `--huge` | transparent huge pages for the buffer, reporting how much the process holds in them (`/sys/kernel/mm/transparent_hugepage/enabled` must allow `madvise`) |
@@ -186,7 +188,10 @@ packing has four, vector loads and stores.
 
 RISC-V encodings are raw (Zicbop, Zihintntl): no `-march` needed, and hints
 are no-ops on cores without the extension -- on the SpacemiT X60, which lacks
-Zihintntl, `l2`, `l3` and `nta` behave as `l1`.
+Zihintntl, `l2`, `l3` and `nta` behave as `l1`. On the X60, packing from memory with
+4 KB pages runs about 4x faster with `prefetch.r` 8 or more columns ahead
+(~100 cycles a line, about four in flight); with transparent huge pages
+(`--huge`) the prefetches have no effect at all.
 
 perf's own errors can land in the middle of its JSON (`Error: failed to open
 tracing events directory` before the closing bracket); the probe then parses

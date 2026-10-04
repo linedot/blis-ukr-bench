@@ -38,6 +38,11 @@
 //   --cols N      --copy: columns per panel, a k_c (240); in groups of four,
 //                 any left over one at a time
 //   --flavor F    --copy: vector, scalar or both (both)
+//   --no-wrap     --copy: prefetch D columns on in the same rows, past the
+//                 panel's (and the matrix's) last column, as a kernel that
+//                 knows only its own panel does (default: packing order)
+//   --pf-pair     --copy: each prefetch twice, at +0 and +32 bytes, as BLIS's
+//                 x60 A copy at LMUL 2 issues them
 //   --reps N      fixed repetitions instead of --min-time, so that perf stat
 //                 around one configuration counts known work; prints how many
 //                 lines (chase) or columns (copy) each configuration touches
@@ -76,7 +81,17 @@ const char* const kind_name[] = {"none", "l1", "l2", "l3", "nta", "w", "load"};
 #define PFS_nta(r)  "add x0, x0, x5\n\tori x0, " r ", 1\n\t"
 #define PFS_w(r)    "ori x0, " r ", 3\n\t"
 #define PFS_load(r) "ld x0, 0(" r ")\n\t"
+// a prefetch and its twin 32 bytes on, as the BLIS x60 A copy issues them
+// (prefetch.r 32(rs1) = ori x0, rs1, 33)
+#define PFP_none(r)
+#define PFP_l1(r)   PFS_l1(r) "ori x0, " r ", 33\n\t"
+#define PFP_l2(r)   PFS_l2(r) "add x0, x0, x2\n\tori x0, " r ", 33\n\t"
+#define PFP_l3(r)   PFS_l3(r) "add x0, x0, x3\n\tori x0, " r ", 33\n\t"
+#define PFP_nta(r)  PFS_nta(r) "add x0, x0, x5\n\tori x0, " r ", 33\n\t"
+#define PFP_w(r)    PFS_w(r) "ori x0, " r ", 35\n\t"
+#define PFP_load(r) PFS_load(r) "ld x0, 32(" r ")\n\t"
 #endif
+
 
 template <kind K>
 inline void touch(const void* p)
@@ -105,6 +120,14 @@ inline void touch(const void* p)
 #else
     (void)p;
 #endif
+}
+
+// touch<K>, twice when `pair`: at p and 32 bytes on
+template <kind K, bool pair>
+inline void touch_pf(const char* p)
+{
+    touch<K>(p);
+    if constexpr (pair) touch<K>(p + 32);
 }
 
 // one function per kind, chosen at run time
@@ -236,23 +259,27 @@ void walk(const std::size_t* buf, const std::size_t* order, std::size_t n, std::
 // one column of an 8-row panel (a 64-byte line) to the packed panel, the load
 // followed by kind K's prefetch of p: for a panel's columns left over after
 // the groups of four
-template <kind K, bool vec>
+#define VEC_KINDS(COPY, PFX)                         \
+    if constexpr (K == none) COPY(PFX##none);        \
+    if constexpr (K == pf_l1) COPY(PFX##l1);         \
+    if constexpr (K == pf_l2) COPY(PFX##l2);         \
+    if constexpr (K == pf_l3) COPY(PFX##l3);         \
+    if constexpr (K == pf_nta) COPY(PFX##nta);       \
+    if constexpr (K == pf_w) COPY(PFX##w);           \
+    if constexpr (K == load) COPY(PFX##load);
+
+template <kind K, bool vec, bool pair>
 inline void copy1(const char* s, const char* p, double* d)
 {
 #if defined(__riscv)
     if constexpr (vec)
     {
-        if constexpr (K == none) VEC_COPY1(PFS_none);
-        if constexpr (K == pf_l1) VEC_COPY1(PFS_l1);
-        if constexpr (K == pf_l2) VEC_COPY1(PFS_l2);
-        if constexpr (K == pf_l3) VEC_COPY1(PFS_l3);
-        if constexpr (K == pf_nta) VEC_COPY1(PFS_nta);
-        if constexpr (K == pf_w) VEC_COPY1(PFS_w);
-        if constexpr (K == load) VEC_COPY1(PFS_load);
+        if constexpr (pair) { VEC_KINDS(VEC_COPY1, PFP_) }
+        else { VEC_KINDS(VEC_COPY1, PFS_) }
     }
     else
     {
-        touch<K>(p);
+        touch_pf<K, pair>(p);
         __asm__ volatile("ld t0, 0(%[s])\n\t"  "ld t1, 8(%[s])\n\t"  "ld t2, 16(%[s])\n\t"
                          "ld t3, 24(%[s])\n\t" "ld t4, 32(%[s])\n\t" "ld t5, 40(%[s])\n\t"
                          "ld t6, 48(%[s])\n\t" "ld a7, 56(%[s])\n\t"
@@ -263,7 +290,7 @@ inline void copy1(const char* s, const char* p, double* d)
                          : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a7", "memory");
     }
 #else
-    touch<K>(p);
+    touch_pf<K, pair>(p);
     if constexpr (vec) std::memcpy(d, s, 64);
     else
         for (int w = 0; w < 8; w++) d[w] = reinterpret_cast<const volatile double*>(s)[w];
@@ -272,7 +299,7 @@ inline void copy1(const char* s, const char* p, double* d)
 
 // columns c..c+3 of one 8-row panel (a 64-byte line each, lda bytes apart) to
 // the packed panel, loads first, each followed by kind K's prefetch of pf[g]
-template <kind K, bool vec>
+template <kind K, bool vec, bool pair>
 inline void copy4(const char* s, std::size_t lda, const char* const* pf, double* d)
 {
     const char *s1 = s + lda, *s2 = s1 + lda, *s3 = s2 + lda;
@@ -280,13 +307,8 @@ inline void copy4(const char* s, std::size_t lda, const char* const* pf, double*
 #if defined(__riscv)
     if constexpr (vec)
     {
-        if constexpr (K == none) VEC_COPY4(PFS_none);
-        if constexpr (K == pf_l1) VEC_COPY4(PFS_l1);
-        if constexpr (K == pf_l2) VEC_COPY4(PFS_l2);
-        if constexpr (K == pf_l3) VEC_COPY4(PFS_l3);
-        if constexpr (K == pf_nta) VEC_COPY4(PFS_nta);
-        if constexpr (K == pf_w) VEC_COPY4(PFS_w);
-        if constexpr (K == load) VEC_COPY4(PFS_load);
+        if constexpr (pair) { VEC_KINDS(VEC_COPY4, PFP_) }
+        else { VEC_KINDS(VEC_COPY4, PFS_) }
     }
     else
     {
@@ -295,7 +317,7 @@ inline void copy4(const char* s, std::size_t lda, const char* const* pf, double*
         const char* const ps[4] = {p0, p1, p2, p3};
         for (int c = 0; c < 4; c++)
         {
-            touch<K>(ps[c]);
+            touch_pf<K, pair>(ps[c]);
             __asm__ volatile("ld t0, 0(%[s])\n\t"  "ld t1, 8(%[s])\n\t"  "ld t2, 16(%[s])\n\t"
                              "ld t3, 24(%[s])\n\t" "ld t4, 32(%[s])\n\t" "ld t5, 40(%[s])\n\t"
                              "ld t6, 48(%[s])\n\t" "ld a7, 56(%[s])\n\t"
@@ -312,7 +334,7 @@ inline void copy4(const char* s, std::size_t lda, const char* const* pf, double*
     const char* const ps[4] = {p0, p1, p2, p3};
     for (int c = 0; c < 4; c++)
     {
-        touch<K>(ps[c]);
+        touch_pf<K, pair>(ps[c]);
         if constexpr (vec) std::memcpy(d + 8 * c, cs[c], 64);
         else
             for (int w = 0; w < 8; w++)
@@ -326,13 +348,15 @@ inline void copy4(const char* s, std::size_t lda, const char* const* pf, double*
 // panel's last column it continues with the next panel's (8 rows down) --
 // tracked by a cursor, since a division per column would cost more than the
 // copy.
-template <kind K, bool vec>
+// Without `wrap`, as a kernel that knows only its own panel: the same rows,
+// D columns on -- past the panel's last column, and the matrix's.
+template <kind K, bool vec, bool pair>
 void pack_all(const double* a, std::size_t rows, std::size_t cols, std::size_t dist,
-              double* panel, long reps)
+              double* panel, long reps, bool wrap)
 {
     const std::size_t lda = rows * sizeof(double);
     const char* const base = reinterpret_cast<const char*>(a);
-    const std::size_t panels_ahead = dist / cols, cols_ahead = dist % cols;
+    const std::size_t panels_ahead = wrap ? dist / cols : 0, cols_ahead = wrap ? dist % cols : dist;
     for (long r = 0; r < reps; r++)
         for (std::size_t i = 0; i < rows; i += 8)
         {
@@ -340,7 +364,8 @@ void pack_all(const double* a, std::size_t rows, std::size_t cols, std::size_t d
             const char* pf = base + prow * sizeof(double) + pcol * lda;
             auto next = [&]() -> const char* {
                 const char* at = pf;
-                if (++pcol == cols)
+                if (!wrap) pf += lda;
+                else if (++pcol == cols)
                 {
                     pcol = 0;
                     prow += 8;
@@ -356,25 +381,27 @@ void pack_all(const double* a, std::size_t rows, std::size_t cols, std::size_t d
                 const char* pfs[4] = {nullptr, nullptr, nullptr, nullptr};
                 if constexpr (K != none)
                     for (auto& p : pfs) p = next();
-                copy4<K, vec>(col, lda, pfs, panel + 8 * c);
+                copy4<K, vec, pair>(col, lda, pfs, panel + 8 * c);
             }
             for (; c < cols; c++, col += lda)
-                copy1<K, vec>(col, K != none ? next() : nullptr, panel + 8 * c);
+                copy1<K, vec, pair>(col, K != none ? next() : nullptr, panel + 8 * c);
         }
 }
 
 template <kind K>
 void pack_vec(const double* a, std::size_t rows, std::size_t cols, std::size_t dist,
-              double* panel, long reps)
+              double* panel, long reps, bool wrap, bool pair)
 {
-    pack_all<K, true>(a, rows, cols, dist, panel, reps);
+    if (pair) pack_all<K, true, true>(a, rows, cols, dist, panel, reps, wrap);
+    else pack_all<K, true, false>(a, rows, cols, dist, panel, reps, wrap);
 }
 
 template <kind K>
 void pack_scalar(const double* a, std::size_t rows, std::size_t cols, std::size_t dist,
-                 double* panel, long reps)
+                 double* panel, long reps, bool wrap, bool pair)
 {
-    pack_all<K, false>(a, rows, cols, dist, panel, reps);
+    if (pair) pack_all<K, false, true>(a, rows, cols, dist, panel, reps, wrap);
+    else pack_all<K, false, false>(a, rows, cols, dist, panel, reps, wrap);
 }
 
 // the vector copy needs 8 doubles in an LMUL-2 group: VLEN >= 256
@@ -397,7 +424,7 @@ struct options
     int cpu = -1;
     double ghz = 0, min_time = 0.1;
     long reps = 0;
-    bool huge = false, copy = false;
+    bool huge = false, copy = false, wrap = true, pair = false;
     std::size_t cols = 240;
     bool vector = true, scalar = true;
     std::vector<kind> kinds;
@@ -409,8 +436,8 @@ struct options
     if (!why.empty()) std::fprintf(stderr, "error: %s\n", why.c_str());
     std::fprintf(stderr,
                  "usage: %s [--pf l1,l2,l3,nta,w,load] [--dist LIST] [--copy] [--cols N]\n"
-                 "       [--flavor vector|scalar|both] [--reps N] [--huge] [--cpu N] [--ghz G]\n"
-                 "       [--min-time S] [SIZE_KB...]\n", argv0);
+                 "       [--flavor vector|scalar|both] [--no-wrap] [--pf-pair] [--reps N]\n"
+                 "       [--huge] [--cpu N] [--ghz G] [--min-time S] [SIZE_KB...]\n", argv0);
     std::exit(1);
 }
 
@@ -496,6 +523,8 @@ options parse(int argc, char** argv)
         else if (a == "--reps") o.reps = static_cast<long>(number(value(), argv[0]));
         else if (a == "--huge") o.huge = true;
         else if (a == "--copy") o.copy = true;
+        else if (a == "--no-wrap") o.wrap = false;
+        else if (a == "--pf-pair") o.pair = true;
         else if (a == "--cols") o.cols = number(value(), argv[0]);
         else if (a == "--pf") pf = value();
         else if (a == "--dist") dist = value();
@@ -570,7 +599,9 @@ int copy_mode(const options& o, double scale, const char* unit)
     if (!vec && !o.scalar) return 0;
     std::printf("# --copy: 8-row panels of a column-major matrix, %zu columns, one 64-byte\n"
                 "# line per column, 4 columns per iteration; %s per column, prefetch D\n"
-                "# columns ahead in packing order (0: none)\n", cols, unit);
+                "# columns ahead %s (0: none)%s\n", cols, unit,
+                o.wrap ? "in packing order" : "in the same rows, past the panel's end",
+                o.pair ? ", each twice (+0, +32)" : "");
     for (const std::size_t kb : o.sizes_kb)
     {
         std::size_t rows = std::max<std::size_t>(8, kb * 1024 / sizeof(double) / cols / 8 * 8);
@@ -584,8 +615,8 @@ int copy_mode(const options& o, double scale, const char* unit)
         auto cost = [&](bool v, kind k, std::size_t d) {
             if (d == 0) k = none;
             return ns_per_item([&](long reps) {
-                if (v) { DISPATCH(k, pack_vec, a, rows, cols, d, panel.data(), reps) }
-                else   { DISPATCH(k, pack_scalar, a, rows, cols, d, panel.data(), reps) }
+                if (v) { DISPATCH(k, pack_vec, a, rows, cols, d, panel.data(), reps, o.wrap, o.pair) }
+                else   { DISPATCH(k, pack_scalar, a, rows, cols, d, panel.data(), reps, o.wrap, o.pair) }
             }, items, o.min_time, o.reps) * scale;
         };
         std::printf("\n# %zu KB: %zu x %zu, lda %zu bytes%s\n  %4s", kb, rows, cols,
