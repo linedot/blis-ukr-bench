@@ -50,6 +50,7 @@ import itertools
 import json
 import math
 import os
+import re
 import signal
 import statistics
 import subprocess
@@ -148,17 +149,19 @@ def per_kstep_table(results, mr, nr):
     """
     groups = {}
     for r in results:
-        groups.setdefault((r['top'], r['m'], r['n'], r['mc'], r['nc']), []).append(r)
-    for (top, *_), rs in groups.items():
-        ks = sorted({r['kc'] for r in rs})
+        key = (r['top'], r.get('size'), r['m'], r['n'], r['mc'], r['nc'])
+        groups.setdefault(key, []).append(r)
+    k_call = lambda r: min(r['kc'], r['k'])        # what each call runs
+    for (top, size, m, n, mc, nc), rs in groups.items():
+        ks = sorted({k_call(r) for r in rs})
         if len(ks) < 3:
             continue
-        print(f"# per call = fixed + per k-step x k_c: top {top}, {len(rs)} runs, "
-              f"k_c {ks[0]}-{ks[-1]}")
+        print(f"# per call = fixed + per k-step x k: top {top}, problem {size}, region "
+              f"{m}x{n} (m_c {mc}, n_c {nc}), {len(rs)} runs, k {ks[0]}-{ks[-1]}")
         print(f"  {'':<30} {'per k-step':>10} {'per call':>10}   off the line by over 10%")
         cols = ['measured_cycles'] + [c for c in rs[0] if c.endswith('_measured')]
         for col in cols:
-            pts = [(r['kc'], r[col] / r['calls']) for r in rs if col in r and r['calls']]
+            pts = [(k_call(r), r[col] / r['calls']) for r in rs if col in r and r['calls']]
             if len(pts) < 3:
                 continue
             c0, b = theil_sen([k for k, _ in pts], [y for _, y in pts])
@@ -168,6 +171,9 @@ def per_kstep_table(results, mr, nr):
             note = (f"   = {2 * mr * nr / b:.2f} FLOP/cycle in the k-loop"
                     if col == 'measured_cycles' and b > 0 else '')
             print(f"  {name:<30} {b:10.2f} {c0:10.0f}   {', '.join(off)}{note}")
+            if col == 'measured_cycles' and c0 < 0:
+                print("  # a negative per-call part: these k span two regimes (the region "
+                      "outgrows a cache between them); split them to compare")
 
 
 def cmd_calibrate(a):
@@ -240,8 +246,12 @@ def cmd_calibrate(a):
     for op, top, w in (('A', 'packA', mr), ('B', 'packB', nr)):
         by_level[op] = {}
         for where, elems in places:
-            kc = min(256, max(8, elems // w // 8 * 8))
+            # 240 and an odd panel count: power-of-two leading dimensions alias in
+            # the cache and measure that instead (a 4-way L1 shows it first)
+            kc = min(240, max(8, elems // w // 8 * 8))
             width = max(w, elems // kc // w * w)
+            if width > w and width & (width - 1) == 0:
+                width += w
             size, blk = (((width, 64, kc), (kc, width, 64)) if op == 'A' else
                          ((64, width, kc), (kc, 64, width)))
             _, row = run_bench(a.bench, ['--size', *size, '--kc', blk[0], '--mc', blk[1],
@@ -356,8 +366,10 @@ def kernel_prefetches(specs, k_c):
         if kmin and k_c < int(kmin):
             continue
         f = spec.split(':')
-        if len(f) > 4 and f[4] in ('k', 'kc'):    # from the start of the call
-            f[4] = str(k_c)
+        if len(f) == 4 and f[3] not in ('', 'keep', 'strm'):
+            f = f[:3] + ['keep', f[3]]            # ir:C:L1:2kc
+        if len(f) > 4 and f[4]:                  # N k-steps, or Nkc: N calls
+            f[4] = str(max(0, round(parse_lead(f[4], k_c))))
         out.append(model.parse_prefetch(':'.join(f)))
     return out
 
@@ -373,12 +385,67 @@ def steady_levels(levels, footprint):
 def to_model_prefetch(spec, levels, u, kc_mean):
     """goto_bench's loop:op:Lx[:hint[:lead in calls]] -> model.sw_prefetch."""
     f = spec.split(':')
+    if int(f[2][1:]) >= len(levels):
+        return None         # a steady state that ends above the target: nothing to fetch
     target = levels[int(f[2][1:]) - 1].name
     hint = f[3] if len(f) > 3 and f[3] else 'keep'
     lead = int(f[4]) if len(f) > 4 and f[4] else 0
     t_k = 2 * u.m_r * u.n_r / u.peak
     dist = math.ceil(lead * u.time(kc_mean) / t_k) if lead else 0
     return model.sw_prefetch(f[0], f[1], target, hint, dist)
+
+
+def parse_block(text, mr, nr):
+    """A block size: N, or a multiple of the micro-tile: Nmr, Nnr (4mr, 200nr, mr)."""
+    m = re.fullmatch(r'(\d*)\s*(mr|nr)', str(text).strip(), re.I)
+    if m:
+        return int(m.group(1) or 1) * (mr if m.group(2).lower() == 'mr' else nr)
+    try:
+        return int(text)
+    except ValueError:
+        raise SystemExit(f"block size {text!r}: give N, Nmr or Nnr") from None
+
+
+def parse_lead(text, k_c=None):
+    """
+    A prefetch lead: N in the spec's own unit, or Nkc / Nk -- N calls ahead
+    (k_c None: goto_bench counts calls), or N*k_c k-steps (the kernel's).
+    """
+    m = re.fullmatch(r'(\d+(?:\.\d+)?|\.\d+)?\s*(kc|k)?', text.strip(), re.I)
+    if not m or not (m.group(1) or m.group(2)):
+        raise SystemExit(f"prefetch lead {text!r}: give N, or Nkc for N calls ahead")
+    n = float(m.group(1)) if m.group(1) else 1.0
+    return n if not m.group(2) or k_c is None else n * k_c
+
+
+def norm_prefetch(spec):
+    """
+    goto_bench's loop:op:Lx[:hint[:lead]], the lead in calls as N or Nkc --
+    also in the hint's place: ir:C:L2:2kc is ir:C:L2:keep:2.
+    """
+    f = spec.split(':')
+    if len(f) == 4 and f[3] not in ('', 'keep', 'strm'):
+        f = f[:3] + ['keep', f[3]]
+    if len(f) > 4 and f[4]:
+        n = parse_lead(f[4])
+        if n != int(n):
+            raise SystemExit(f"prefetch {spec}: goto_bench prefetches whole tiles, so "
+                             "its lead is a whole number of calls")
+        f[4] = str(int(n))
+    return ':'.join(f)
+
+
+def c_aliasing(ld, count, L1):
+    """
+    How many of a C tile's `count` columns (rows, for row-major C), `ld`
+    elements apart, land in each L1 set: above the associativity they evict
+    each other on every call.  0 when they fit.
+    """
+    if not L1.assoc or not math.isfinite(L1.size):
+        return 0
+    way = int(L1.size) // L1.assoc
+    per_set = math.ceil(count / (way // math.gcd(8 * ld, way)))
+    return per_set if per_set > L1.assoc else 0
 
 
 def parse_size(s):
@@ -420,10 +487,15 @@ def cmd_run(a):
         print(f"# note: no calibrated prefetch hook for {' '.join(a.prefetch)}: "
               f"calibrate with the same --prefetch to charge its cost")
     pack = dict(kv.split(':') for kv in a.pack.split(','))
+    blocks = [[parse_block(x, calib['mr'], calib['nr']) for x in xs]
+              for xs in (a.kc, a.mc, a.nc)]
+    if len(a.size) > 1:
+        print("# problems: " + ', '.join('x'.join(map(str, parse_size(s))) for s in a.size)
+              + "  (one MxNxK problem is written 512x14x96)")
     results = []
     print(f"{'top':>4} {'size':>16} {'kc':>5} {'mc':>5} {'nc':>6}  {'measured':>9} {'model':>9} "
           f"{'ratio':>6} {'GHz':>5}  model bound")
-    for size, kc, mc, nc, top in itertools.product(a.size, a.kc, a.mc, a.nc, a.top):
+    for size, kc, mc, nc, top in itertools.product(a.size, *blocks, a.top):
         m, n, k = parse_size(size)
         args = ['--size', m, n, k, '--kc', kc, '--mc', mc, '--nc', nc, '--top', top,
                 '--pack', a.pack, '--c-layout', a.c_layout, '--beta', a.beta,
@@ -457,10 +529,19 @@ def cmd_run(a):
             lv, mem = steady_levels(lev, foot)
             if mem:
                 flags.append(f'steady state: {mem} as memory')
+        ld, count = (m, u.n_r) if a.c_layout == 'cm' else (n, u.m_r)
+        per_set = c_aliasing(ld, count, lev[0])
+        if per_set:
+            flags.append(f"C's leading dimension {ld} puts {per_set} of a tile's {count} "
+                         f"{'columns' if a.c_layout == 'cm' else 'rows'} in each L1 set "
+                         f"({lev[0].assoc}-way): conflict misses on every call")
         b = model.blocking(kc, mc, nc)
         p = model.problem(me, ne, ke)
         kc_mean = ke / math.ceil(ke / kc)
-        sw = [to_model_prefetch(s, lv, u, kc_mean) for s in a.prefetch]
+        sw = [x for x in (to_model_prefetch(s, lv, u, kc_mean) for s in a.prefetch) if x]
+        if len(sw) < len(a.prefetch):
+            flags.append(f"a prefetch below {mem}, the steady state's memory: not modelled")
+        n_harness = len(sw)
         sw += kernel_prefetches(a.kernel_prefetch, kc)
         hw = model.hw_prefetcher(a.pf_streams, a.pf_min_run, a.pf_level.upper())
         an = model.analyse(u, b, p, lv, pk, True, a.core_mshr, hw,
@@ -469,7 +550,7 @@ def cmd_run(a):
             # the hook's own loads and stores; its prefetch instructions the
             # model already counts
             ks_all = p.m * p.n * p.k / (u.m_r * u.n_r)
-            pf_n = sum(ev.instr_per_kstep for ev in an.evals[:len(a.prefetch)]) * ks_all / an.calls
+            pf_n = sum(ev.instr_per_kstep for ev in an.evals[:n_harness]) * ks_all / an.calls
             an.kernel = dataclasses.replace(u, call_ld=u.call_ld + max(0.0, hook['ld'] - pf_n),
                                             call_st=u.call_st + hook['st'])
         pred = model.predict(an)
@@ -478,7 +559,7 @@ def cmd_run(a):
                'measured_cycles': meas, 'model_cycles': pred.time,
                'measured_flop_per_cycle': fm, 'model_flop_per_cycle': fp,
                'ratio': fm / fp, 'model_bound': pred.bound, 'cycles_from': src,
-               'calls': an.calls,
+               'calls': an.calls, 'size': f"{m}x{n}x{k}",
                'flags': '; '.join(flags)}
         if emap:
             ev = model.counters(an, a.vl).events
@@ -574,10 +655,12 @@ def main(argv=None):
     r.add_argument('--cache', nargs='+', required=True, metavar='LEVEL',
                    help="model.py's --cache spec for this machine")
     r.add_argument('--level-names', default='')
-    r.add_argument('--size', nargs='+', required=True, help='N for a cube, or M,N,K')
-    r.add_argument('--kc', nargs='+', type=int, required=True)
-    r.add_argument('--mc', nargs='+', type=int, required=True)
-    r.add_argument('--nc', nargs='+', type=int, required=True)
+    r.add_argument('--size', nargs='+', required=True,
+                   help='problems: N for a cube, MxNxK (or M,N,K) otherwise -- '
+                        'three numbers are three cubes')
+    r.add_argument('--kc', nargs='+', required=True, help='N, or Nmr / Nnr')
+    r.add_argument('--mc', nargs='+', required=True, help='N, or a multiple of the tile: 4mr')
+    r.add_argument('--nc', nargs='+', required=True, help='N, or a multiple of the tile: 200nr')
     r.add_argument('--top', nargs='+', default=['jc'], choices=RUNGS[:6])
     r.add_argument('--pack', default='A:ic,B:pc')
     r.add_argument('--prefetch', nargs='*', default=[],
@@ -623,6 +706,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     global PIN
     PIN = ['--cpu', str(a.cpu)] if getattr(a, 'cpu', None) is not None else []
+    if getattr(a, 'prefetch', None):
+        a.prefetch = [norm_prefetch(s) for s in a.prefetch]
     return {'detect-cache': cmd_detect_cache, 'calibrate': cmd_calibrate, 'run': cmd_run}[a.cmd](a)
 
 

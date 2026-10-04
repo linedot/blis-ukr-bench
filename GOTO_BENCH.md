@@ -37,6 +37,9 @@ goto_bench --size 256 2000 160 --kc 160 --mc 256 --nc 2000 --top packA
 # next C tile into L2, and next_b (B_r of the next jr, one call ahead)
 goto_bench ... --prefetch ir:C:L2 jr:B:L2:keep:1
 
+# blocks as multiples of the micro-tile; C two calls ahead
+goto_bench --size 4000 4000 4000 --kc 160 --mc 20mr --nc 200nr --prefetch ir:C:L2:2kc
+
 # counters, as found by probe_events.py
 goto_bench ... --events-file events.txt --group 4
 
@@ -58,9 +61,14 @@ Options
   uses in execution order (crossing loop boundaries, so `ir:C` reaches the
   next column's first tile). If the operand is packed above that loop, the
   packed block is prefetched; otherwise the source its next pack will read.
-  `lead` is in micro-kernel calls before the end of the loop's iteration;
-  default: issued at its start, i.e. one iteration ahead. C is prefetched for
-  writing. The k-loop is inside the kernel and cannot be prefetched from here.
+  `lead` is in micro-kernel calls before the end of the loop's iteration,
+  `N` or `Nkc` (N calls of k_c k-steps), and may stand in the hint's place:
+  `ir:C:L2:2kc` is `ir:C:L2:keep:2`; default: issued at its start, i.e. one
+  iteration ahead. C is prefetched for writing. The k-loop is inside the
+  kernel and cannot be prefetched from here.
+* `--kc`, `--mc`, `--nc` take `N` or a multiple of the micro-tile: `4mr`,
+  `200nr`, `mr` -- resolved once the kernel is known; `validate.py run` takes
+  several of each.
 * `--c-layout rm|cm`, `--beta general|one|zero|X`, `--alpha X`. A and B are
   column-major.
 * `--events E,E,...` / `--events-file F`, `--group N`, `--cycles-event E` --
@@ -206,8 +214,16 @@ may move C element by element or through a temporary tile. goto_bench prints
 the kernel's preference; calibrate with the layout you run (`run` warns when
 they differ).
 
+`run` takes several problems: `--size 4000 512x14x96` is a 4000 cube and one
+512x14x96 problem -- three bare numbers are three cubes, and the run lists the
+problems it took. A run is flagged when C's leading dimension makes a tile's
+columns (rows, for row-major C) share L1 sets beyond the associativity: with
+ldc = 512 doubles, the 14 columns of an 8x14 tile fall in two set groups of a
+32 KB 4-way L1, seven lines per set, and evict each other on every call.
+
 `run --per-kstep` splits cycles and every counter, per call, into a fixed part
-and a part per k-step, fitted over runs that differ only in k_c (Theil-Sen:
+and a part per k-step, fitted per problem and region over runs that differ
+only in the k each call runs, min(k_c, k) (Theil-Sen:
 the median of pairwise slopes, so one run in another regime does not tilt the
 line, and runs more than 10% off it are listed). The per-k-step part is the
 k-loop's; the fixed part is the C update, the call, a prefetch hook. On the
@@ -284,7 +300,8 @@ The model sees only the prefetches goto_bench issues, unless told more:
 syntax with the lead in k-steps, and `--pf-streams`, `--pf-min-run`,
 `--pf-level` describe the hardware prefetcher as in model.py. A kernel may
 prefetch only above some k_c; end the spec in `@KMIN` for that. A lead of `k`
-means the whole k-loop: a prefetch issued at the call's start, as BLIS's
+(or `kc`; `2kc` is two calls' worth, `0.5kc` half of one) means the whole
+k-loop: a prefetch issued at the call's start, as BLIS's
 armv8a 8x6 dgemm kernel does for its C rows (`ir:C:L1:keep:k`). AOCL's 8x24
 dgemm kernel prefetches its C tile only once k/4 exceeds its 24-iteration
 tail, i.e. for k_c >= 128, then 100-128 k-steps ahead: `ir:C:L1:keep:100@128`.

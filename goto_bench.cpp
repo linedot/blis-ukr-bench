@@ -16,6 +16,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -50,12 +51,15 @@ struct options
     bool verify_lib = false;
     int cpu = -1;
     std::string label;
+    std::string kc_text, mc_text, nc_text;   // resolved once the kernel's mr, nr are known
 };
 
 [[noreturn]] void usage(const char* prog, const std::string& why = "")
 {
     if (!why.empty()) std::fprintf(stderr, "error: %s\n\n", why.c_str());
     std::fprintf(stderr, R"(usage: %s --size M N K --kc KC --mc MC --nc NC [options]
+
+  KC, MC, NC          N, or a multiple of the micro-tile: 4mr, 200nr, mr
 
 region
   --top RUNG          outermost rung executed: ukr ir jr ic pc jc (default jc),
@@ -70,7 +74,9 @@ region
                         target  L1 L2 L3
                         hint    keep (default) or strm
                         lead    micro-kernel calls before the end of the loop's
-                                iteration (default: issued at its start)
+                                iteration (default: issued at its start), as N
+                                or Nkc; it may stand in the hint's place:
+                                ir:C:L2:2kc is ir:C:L2:keep:2
                       C is prefetched for writing
 
 counters
@@ -114,6 +120,53 @@ std::vector<std::string> split(const std::string& s, char sep)
     return out;
 }
 
+// A block size: N, or a multiple of the micro-tile, Nmr / Nnr ("4mr", "200nr", "mr").
+long long parse_block(const std::string& t, long long mr, long long nr)
+{
+    std::string s;
+    for (char c : t) s += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    long long unit = 1;
+    if (s.size() >= 2 && (s.compare(s.size() - 2, 2, "mr") == 0 || s.compare(s.size() - 2, 2, "nr") == 0))
+    {
+        unit = s[s.size() - 2] == 'm' ? mr : nr;
+        s.resize(s.size() - 2);
+        if (s.empty()) return unit;
+    }
+    std::size_t used = 0;
+    long long n = 0;
+    try { n = std::stoll(s, &used); } catch (const std::exception&) { used = 0; }
+    if (used != s.size() || s.empty() || n <= 0)
+        throw std::invalid_argument("block size " + t + ": give N, Nmr or Nnr");
+    return n * unit;
+}
+
+// A prefetch lead in calls: N, or Nkc / Nk (N calls of k_c k-steps), "kc" for one.
+long parse_lead(const std::string& t, const std::string& tok)
+{
+    if (t.empty()) return 0;
+    std::string s;
+    for (char c : t) s += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    bool suffix = false;
+    for (const char* suf : {"kc", "k"})
+    {
+        const std::size_t n = std::char_traits<char>::length(suf);
+        if (s.size() >= n && s.compare(s.size() - n, n, suf) == 0)
+        {
+            s.resize(s.size() - n);
+            suffix = true;
+            break;
+        }
+    }
+    if (suffix && s.empty()) return 1;
+    std::size_t used = 0;
+    long n = -1;
+    try { n = std::stol(s, &used); } catch (const std::exception&) { used = 0; }
+    if (used != s.size() || s.empty() || n < 0)
+        throw std::invalid_argument("prefetch " + tok + ": lead must be a whole number of "
+                                    "calls, N or Nkc");
+    return n;
+}
+
 prefetch_spec parse_prefetch(const std::string& tok)
 {
     const auto f = split(tok, ':');
@@ -135,13 +188,17 @@ prefetch_spec parse_prefetch(const std::string& tok)
     else if (f[2] == "L2") s.kind.level = pf_level::L2;
     else if (f[2] == "L3") s.kind.level = pf_level::L3;
     else throw std::invalid_argument("prefetch " + tok + ": target must be L1, L2 or L3");
-    const std::string hint = f.size() > 3 ? f[3] : "keep";
-    if (hint != "keep" && hint != "strm")
-        throw std::invalid_argument("prefetch " + tok + ": hint must be keep or strm");
+    std::string hint = "keep", lead;
+    if (f.size() > 3 && !f[3].empty())
+    {
+        if (f[3] == "keep" || f[3] == "strm") hint = f[3];
+        else if (f.size() == 4) lead = f[3];            // loop:operand:target:lead
+        else throw std::invalid_argument("prefetch " + tok + ": hint must be keep or strm");
+    }
+    if (f.size() > 4) lead = f[4];
     s.kind.stream = hint == "strm";
     s.kind.write = s.operand == 'C';
-    s.lead = f.size() > 4 && !f[4].empty() ? std::stol(f[4]) : 0;
-    if (s.lead < 0) throw std::invalid_argument("prefetch " + tok + ": lead cannot be negative");
+    s.lead = parse_lead(lead, tok);
     return s;
 }
 
@@ -171,9 +228,9 @@ options parse(int argc, char** argv)
         const std::string a = argv[i];
         if (a == "--size") { need(i, 3); o.cfg.m = std::stoll(argv[++i]); o.cfg.n = std::stoll(argv[++i]);
                              o.cfg.k = std::stoll(argv[++i]); have_size = true; }
-        else if (a == "--kc") { need(i, 1); o.cfg.kc = std::stoll(argv[++i]); }
-        else if (a == "--mc") { need(i, 1); o.cfg.mc = std::stoll(argv[++i]); }
-        else if (a == "--nc") { need(i, 1); o.cfg.nc = std::stoll(argv[++i]); }
+        else if (a == "--kc") { need(i, 1); o.kc_text = argv[++i]; }
+        else if (a == "--mc") { need(i, 1); o.mc_text = argv[++i]; }
+        else if (a == "--nc") { need(i, 1); o.nc_text = argv[++i]; }
         else if (a == "--top") { need(i, 1); o.top = argv[++i]; }
         else if (a == "--pack") { need(i, 1); pack = argv[++i]; }
         else if (a == "--c-layout") { need(i, 1); const std::string v = argv[++i];
@@ -217,7 +274,7 @@ options parse(int argc, char** argv)
         else if (a == "-h" || a == "--help") usage(argv[0]);
         else usage(argv[0], "unknown option " + a);
     }
-    if (!have_size || !o.cfg.kc || !o.cfg.mc || !o.cfg.nc)
+    if (!have_size || o.kc_text.empty() || o.mc_text.empty() || o.nc_text.empty())
         usage(argv[0], "--size, --kc, --mc and --nc are required");
     if (o.top != "packA" && o.top != "packB") o.cfg.top = parse_rung(o.top);
     if (o.cfg.top == R_PRE) usage(argv[0], "--top cannot be pre");
@@ -268,6 +325,13 @@ int main(int argc, char** argv)
 #endif
 
     blis_kernels ker;
+    try
+    {
+        o.cfg.kc = parse_block(o.kc_text, ker.mr, ker.nr);
+        o.cfg.mc = parse_block(o.mc_text, ker.mr, ker.nr);
+        o.cfg.nc = parse_block(o.nc_text, ker.mr, ker.nr);
+    }
+    catch (const std::exception& e) { usage(argv[0], e.what()); }
     const bool pack_mode = o.top == "packA" || o.top == "packB";
     if (pack_mode) o.cfg.top = R_UKR;   // nothing of the nest runs; just pack
 
