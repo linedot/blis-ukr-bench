@@ -147,27 +147,44 @@ how far ahead it must go, without BLIS or counters:
 
 ```
 build/prefetch_test --cpu 5 --ghz 1.6 16 256 4096 [--huge]
+build/prefetch_test --cpu 5 --ghz 1.6 --copy --pf l1,w --dist 0,4-32:4 256 4096
 ```
 
 It walks a buffer's 64-byte lines in a random order, which no hardware
 prefetcher follows, each line holding the index of the next: a pointer chase,
-so every miss costs its full latency. `chase` is that latency for the level
-the buffer lives in. The same walk with a prefetch D lines ahead -- `pf.L1`
-(RISC-V `prefetch.r`, x86 `prefetcht0`, AArch64 `prfm pldl1keep`), `pf.L2`
-(`ntl.p1` + `prefetch.r`, `prefetcht1`, `pldl2keep`), or `load`, a plain load
-whose value is discarded (`ld x0`) -- falls to the L1 row's cost once D steps
-cover the latency. `pf.L1` no better than `chase` at any D means the core
-ignores the prefetch (Zicbop allows that); `load` better than `pf.L1` means it
-drops prefetches but not loads. An out-of-order core runs ahead and hides D; on
-an in-order one the D where a column flattens is the distance needed. `--huge`
-asks for transparent huge pages, keeping TLB misses out of the larger sizes.
+so every miss costs its full latency. `chase alone` is that latency for the
+level the buffer lives in. The same walk with a prefetch D lines ahead falls to
+the L1 row's cost once D steps cover the latency -- if the prefetch does
+anything. An out-of-order core runs ahead and hides D; on an in-order one the D
+where a column flattens is the distance needed.
 
 `--copy` packs instead, the way BLIS packs A: 8-row panels of a column-major
 matrix, one 64-byte line per column, four columns per iteration, loaded then
 stored -- with vector loads (`vle64` at LMUL 2, VLEN >= 256) and with scalar
-`ld`/`sd`, each with `prefetch.r` D columns ahead (D = 0: none). The chase has
-one miss in flight and scalar loads; packing has four and vector loads, so a
-prefetch that helps the chase but not `--copy` points at one of those.
+`ld`/`sd`, each with the prefetch D columns ahead (D = 0: none). The chase has
+one miss in flight and scalar loads; packing has four, vector loads and stores.
+
+| option | |
+|---|---|
+| `--pf KINDS` | prefetches to compare (default `l1,l2,load`; `--copy`: `l1`) |
+| `--dist LIST` | D values: numbers and ranges `a-b` or `a-b:step` (default `1,2,4,8,16,32,64`; `--copy`: `0,4,8,16,32`) |
+| `--cols N` | `--copy`: columns per panel, a k_c (240) |
+| `--flavor F` | `--copy`: `vector`, `scalar` or `both` |
+| `--reps N` | fixed repetitions instead of `--min-time`, and the lines or columns each configuration touches: wrap one configuration in `perf stat` and count per line |
+| `--huge` | transparent huge pages for the buffer, reporting how much the process holds in them (`/sys/kernel/mm/transparent_hugepage/enabled` must allow `madvise`) |
+
+| kind | RISC-V | x86 | AArch64 |
+|---|---|---|---|
+| `l1` | `prefetch.r` | `prefetcht0` | `prfm pldl1keep` |
+| `l2` | `ntl.p1` + `prefetch.r` | `prefetcht1` | `prfm pldl2keep` |
+| `l3` | `ntl.pall` + `prefetch.r` | `prefetcht2` | `prfm pldl3keep` |
+| `nta` | `ntl.all` + `prefetch.r` | `prefetchnta` | `prfm pldl1strm` |
+| `w` | `prefetch.w` | `prefetchw` | `prfm pstl1keep` |
+| `load` | `ld x0` | `mov` | `ldr` |
+
+RISC-V encodings are raw (Zicbop, Zihintntl): no `-march` needed, and hints
+are no-ops on cores without the extension -- on the SpacemiT X60, which lacks
+Zihintntl, `l2`, `l3` and `nta` behave as `l1`.
 
 perf's own errors can land in the middle of its JSON (`Error: failed to open
 tracing events directory` before the closing bracket); the probe then parses
