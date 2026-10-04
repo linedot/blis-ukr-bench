@@ -488,6 +488,20 @@ def cmd_run(a):
         events_file = tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False)
         events_file.write('\n'.join(emap.values()) + '\n')
         events_file.close()
+    # --sum NAME=EV1+EV2: events counted apart on this core that the model
+    # counts as one (on the SpacemiT X60, L1 refills from demand misses and
+    # from the hardware prefetcher)
+    sums = []
+    for item in a.sum or []:
+        name, _, rhs = item.partition('=')
+        parts = [x.strip().upper() for x in rhs.split('+') if x.strip()]
+        if not name or not parts:
+            raise SystemExit(f"--sum {item}: give NAME=EVENT+EVENT")
+        missing = [c for c in parts if c not in emap]
+        if missing:
+            raise SystemExit(f"--sum {item}: not measured (not in --events-map, or left out by "
+                             f"--only): {', '.join(missing)}")
+        sums.append((name.strip().upper(), parts))
     u = kernel_from(calib, a.beta, a.bcast, a.call_uops)
     hook = calib.get('prefetch_hook', {}).get(' '.join(sorted(a.prefetch)))
     if hook and a.prefetch:
@@ -581,6 +595,13 @@ def cmd_run(a):
                     res[f"{canon}_measured"] = float(row[col])
                     if ev.get(canon, 0) > 0:
                         res[f"{canon}_model"] = ev[canon]
+            # --sum: measured events added up, against the model's event of that name
+            for name, parts in sums:
+                vals = [res.get(f"{c}_measured") for c in parts]
+                if all(v is not None for v in vals):
+                    res[f"sum:{name}_measured"] = sum(vals)
+                    if ev.get(name, 0) > 0:
+                        res[f"sum:{name}_model"] = ev[name]
             occ = [res.get(f"L1D_MISS_OCCUPANCY_{w}") for w in ('measured', 'model')]
             ref = [res.get(f"L1D_CACHE_REFILL_{w}") for w in ('measured', 'model')]
             for w, o, r, t in zip(('measured', 'model'), occ, ref, (meas, pred.time)):
@@ -592,6 +613,11 @@ def cmd_run(a):
         print(f"{top:>4} {f'{me}x{ne}x{ke}':>16} {kc:>5} {mc:>5} {nc:>6}  {fm:9.2f} {fp:9.2f} "
               f"{fm / fp:6.2f} {f'{ghz_run:.2f}' if ghz_run else '-':>5}  {pred.bound}"
               + (f"   [{res['flags']}]" if flags else ''))
+        for name, parts in sums:
+            mv, pv = res.get(f"sum:{name}_measured"), res.get(f"sum:{name}_model")
+            if mv is not None and pv:
+                print(f"       {name + ' = ' + '+'.join(parts):<40} measured {mv:14.0f}  "
+                      f"model {pv:14.0f}  ratio {mv / pv:6.2f}")
         for canon in emap:
             mv, pv = res.get(f"{canon}_measured"), res.get(f"{canon}_model")
             if mv is not None and pv:
@@ -716,6 +742,10 @@ def main(argv=None):
                    help='events per counter group; each group, led by the cycle '
                         'counter, is its own pass over the region: '
                         'ceil(events / GROUP) passes')
+    r.add_argument('--sum', action='append', metavar='NAME=EV1+EV2',
+                   help='also print measured events added up against the model\'s NAME; '
+                        'on the SpacemiT X60 L1D_CACHE_REFILL=L1D_CACHE_REFILL+'
+                        'L1D_HW_PREFETCH_REFILL, its refill event counting demand misses only')
     r.add_argument('--only', nargs='+', metavar='EVENT',
                    help='measure only these events of --events-map: fewer passes '
                         'for long runs')

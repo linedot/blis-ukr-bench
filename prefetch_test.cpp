@@ -42,7 +42,15 @@
 //                 panel's (and the matrix's) last column, as a kernel that
 //                 knows only its own panel does (default: packing order)
 //   --pf-pair     --copy: each prefetch twice, at +0 and +32 bytes, as BLIS's
-//                 x60 A copy at LMUL 2 issues them
+//                 x60 A copy at LMUL 2 issued them
+//   --copy-b      pack like BLIS packs B instead: n_r-wide panels of a
+//                 column-major matrix, a block of VL rows at a time, each
+//                 column loaded along k (vle64), then stored into the panel a
+//                 row apart (vsse64); --cols is k_c, the prefetch D lines on
+//                 along each column, once per line
+//   --nr N        --copy-b: panel width, 4, 8, 14 or 16 (14)
+//   --pf-every-block  --copy-b: prefetch in every block -- twice per line
+//                 when a block is shorter than one, as BLIS's x60 B packing did
 //   --reps N      fixed repetitions instead of --min-time, so that perf stat
 //                 around one configuration counts known work; prints how many
 //                 lines (chase) or columns (copy) each configuration touches
@@ -418,6 +426,142 @@ bool vector_copy_fits()
 #endif
 }
 
+// ---- --copy-b: B-panel packing ---------------------------------------------
+// One block: VL rows (k) of n_r source columns, ldb bytes apart, as BLIS's
+// x60 B packing does it -- each column's VL elements with one vle64 (LMUL 1),
+// each load followed by the prefetch, then every column with a strided vsse64
+// into the panel (row stride n_r doubles). v8.. hold the columns.
+#if defined(__riscv_vector)
+#define VCLOBBER_B , "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", \
+                     "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23"
+#else
+#define VCLOBBER_B
+#endif
+#if defined(__riscv)
+#define BLD(n, PFM) "vle64.v v" #n ", (%[t])\n\t" PFM "add %[t], %[t], %[ldb]\n\t"
+#define BST(n)      "vsse64.v v" #n ", (%[u]), %[ds]\n\t" "addi %[u], %[u], 8\n\t"
+// the prefetch of the column being loaded: pfoff bytes on along it
+#define BPF_none
+#define BPF_l1   "add %[t3], %[t], %[pfoff]\n\t" PFS_l1("%[t3]")
+#define BPF_l2   "add %[t3], %[t], %[pfoff]\n\t" PFS_l2("%[t3]")
+#define BPF_l3   "add %[t3], %[t], %[pfoff]\n\t" PFS_l3("%[t3]")
+#define BPF_nta  "add %[t3], %[t], %[pfoff]\n\t" PFS_nta("%[t3]")
+#define BPF_w    "add %[t3], %[t], %[pfoff]\n\t" PFS_w("%[t3]")
+#define BPF_load "add %[t3], %[t], %[pfoff]\n\t" PFS_load("%[t3]")
+#define BLOADS4(PFM) BLD(8, PFM) BLD(9, PFM) BLD(10, PFM) BLD(11, PFM)
+#define BSTORES4 BST(8) BST(9) BST(10) BST(11)
+#define BLOADS8(PFM) BLD(8, PFM) BLD(9, PFM) BLD(10, PFM) BLD(11, PFM) BLD(12, PFM) BLD(13, PFM) BLD(14, PFM) BLD(15, PFM)
+#define BSTORES8 BST(8) BST(9) BST(10) BST(11) BST(12) BST(13) BST(14) BST(15)
+#define BLOADS14(PFM) BLD(8, PFM) BLD(9, PFM) BLD(10, PFM) BLD(11, PFM) BLD(12, PFM) BLD(13, PFM) BLD(14, PFM) BLD(15, PFM) BLD(16, PFM) BLD(17, PFM) BLD(18, PFM) BLD(19, PFM) BLD(20, PFM) BLD(21, PFM)
+#define BSTORES14 BST(8) BST(9) BST(10) BST(11) BST(12) BST(13) BST(14) BST(15) BST(16) BST(17) BST(18) BST(19) BST(20) BST(21)
+#define BLOADS16(PFM) BLD(8, PFM) BLD(9, PFM) BLD(10, PFM) BLD(11, PFM) BLD(12, PFM) BLD(13, PFM) BLD(14, PFM) BLD(15, PFM) BLD(16, PFM) BLD(17, PFM) BLD(18, PFM) BLD(19, PFM) BLD(20, PFM) BLD(21, PFM) BLD(22, PFM) BLD(23, PFM)
+#define BSTORES16 BST(8) BST(9) BST(10) BST(11) BST(12) BST(13) BST(14) BST(15) BST(16) BST(17) BST(18) BST(19) BST(20) BST(21) BST(22) BST(23)
+#define B_BLOCK(LOADS, STORES)                                                        \
+    __asm__ volatile(".option push\n\t.option arch, +v\n\t"                              \
+                     "vsetvli zero, %[vl], e64, m1, ta, ma\n\t"                            \
+                     "mv %[t], %[src]\n\t" LOADS                                            \
+                     "mv %[u], %[dst]\n\t" STORES                                           \
+                     ".option pop"                                                         \
+                     : [t] "=&r"(t), [u] "=&r"(u), [t3] "=&r"(t3)                          \
+                     : [src] "r"(src), [dst] "r"(dst), [ldb] "r"(ldb), [ds] "r"(ds),       \
+                       [vl] "r"(vl), [pfoff] "r"(pfoff)                                    \
+                     : "memory" VCLOBBER_B)
+#define B_WIDTHS(PFM)                                                     \
+    if constexpr (NR == 4) B_BLOCK(BLOADS4(PFM), BSTORES4);               \
+    if constexpr (NR == 8) B_BLOCK(BLOADS8(PFM), BSTORES8);               \
+    if constexpr (NR == 14) B_BLOCK(BLOADS14(PFM), BSTORES14);            \
+    if constexpr (NR == 16) B_BLOCK(BLOADS16(PFM), BSTORES16);
+#endif
+
+// one block of an n_r-wide B panel: rows src..src+vl of each column to the
+// packed panel at dst; the prefetch of each column `pfoff` bytes on
+template <kind K, int NR, bool vec>
+inline void b_block(const char* src, std::size_t ldb, std::size_t vl, long pfoff, double* dst)
+{
+    const std::size_t ds = NR * sizeof(double);
+#if defined(__riscv)
+    if constexpr (vec)
+    {
+        const char *t, *t3;
+        double* u;
+        if constexpr (K == none) { B_WIDTHS(BPF_none) }
+        if constexpr (K == pf_l1) { B_WIDTHS(BPF_l1) }
+        if constexpr (K == pf_l2) { B_WIDTHS(BPF_l2) }
+        if constexpr (K == pf_l3) { B_WIDTHS(BPF_l3) }
+        if constexpr (K == pf_nta) { B_WIDTHS(BPF_nta) }
+        if constexpr (K == pf_w) { B_WIDTHS(BPF_w) }
+        if constexpr (K == load) { B_WIDTHS(BPF_load) }
+        (void)t; (void)t3; (void)u;
+        return;
+    }
+#endif
+    // scalar (and the reference elsewhere): a column at a time, its elements
+    // loaded, the prefetch, then stored a panel row apart
+    (void)ds;
+    for (int j = 0; j < NR; j++)
+    {
+        const double* col = reinterpret_cast<const double*>(src + j * ldb);
+        double e[16];
+        for (std::size_t r = 0; r < vl; r++) e[r] = reinterpret_cast<const volatile double*>(col)[r];
+        touch<K>(reinterpret_cast<const char*>(col) + pfoff);
+        for (std::size_t r = 0; r < vl; r++) dst[r * NR + j] = e[r];
+    }
+}
+
+// every n_r-wide panel of a kc x n matrix (ldb = kc doubles) into one panel
+// buffer, block by block. The prefetch aims `dist` lines on along each
+// column, once per line: with blocks shorter than a line it alternates every
+// block with -64, the line just read, as the BLIS x60 kernel does -- unless
+// `every_block`, the scheme that prefetched each line twice.
+template <kind K, int NR, bool vec>
+void pack_b_all(const double* b, std::size_t kc, std::size_t panels, std::size_t vl,
+                std::size_t dist, bool every_block, double* panel, long reps)
+{
+    const std::size_t ldb = kc * sizeof(double), block_bytes = vl * sizeof(double);
+    const long ahead = static_cast<long>(dist * line);
+    const bool alternate = !every_block && block_bytes < line;
+    for (long r = 0; r < reps; r++)
+        for (std::size_t q = 0; q < panels; q++)
+        {
+            const char* col0 = reinterpret_cast<const char*>(b + q * NR * kc);
+            long pfoff = ahead;
+            for (std::size_t p = 0; p < kc; p += vl)
+            {
+                b_block<K, NR, vec>(col0 + p * sizeof(double), ldb, vl, pfoff, panel + p * NR);
+                if (alternate) pfoff = pfoff == ahead ? -static_cast<long>(line) : ahead;
+            }
+        }
+}
+
+template <kind K>
+void pack_b(bool vec, std::size_t nr, const double* b, std::size_t kc, std::size_t panels,
+            std::size_t vl, std::size_t dist, bool every_block, double* panel, long reps)
+{
+#define PACK_B_NR(N)                                                                          \
+    if (nr == N)                                                                              \
+    {                                                                                         \
+        if (vec) pack_b_all<K, N, true>(b, kc, panels, vl, dist, every_block, panel, reps);   \
+        else pack_b_all<K, N, false>(b, kc, panels, vl, dist, every_block, panel, reps);      \
+        return;                                                                               \
+    }
+    PACK_B_NR(4) PACK_B_NR(8) PACK_B_NR(14) PACK_B_NR(16)
+#undef PACK_B_NR
+}
+
+// the vector block height: VLMAX at e64, m1 (4 doubles at VLEN 256)
+std::size_t vector_rows()
+{
+#if defined(__riscv)
+    std::size_t vl = 0;
+    __asm__ volatile(".option push\n\t.option arch, +v\n\t"
+                     "vsetvli %0, zero, e64, m1, ta, ma\n\t"
+                     ".option pop" : "=r"(vl));
+    return vl;
+#else
+    return 4;
+#endif
+}
+
 // ---- options -----------------------------------------------------------------
 struct options
 {
@@ -425,6 +569,8 @@ struct options
     double ghz = 0, min_time = 0.1;
     long reps = 0;
     bool huge = false, copy = false, wrap = true, pair = false;
+    bool copy_b = false, every_block = false;
+    std::size_t nr = 14;
     std::size_t cols = 240;
     bool vector = true, scalar = true;
     std::vector<kind> kinds;
@@ -436,7 +582,8 @@ struct options
     if (!why.empty()) std::fprintf(stderr, "error: %s\n", why.c_str());
     std::fprintf(stderr,
                  "usage: %s [--pf l1,l2,l3,nta,w,load] [--dist LIST] [--copy] [--cols N]\n"
-                 "       [--flavor vector|scalar|both] [--no-wrap] [--pf-pair] [--reps N]\n"
+                 "       [--flavor vector|scalar|both] [--no-wrap] [--pf-pair] [--copy-b]\n"
+                 "       [--nr N] [--pf-every-block] [--reps N]\n"
                  "       [--huge] [--cpu N] [--ghz G] [--min-time S] [SIZE_KB...]\n", argv0);
     std::exit(1);
 }
@@ -524,6 +671,9 @@ options parse(int argc, char** argv)
         else if (a == "--huge") o.huge = true;
         else if (a == "--copy") o.copy = true;
         else if (a == "--no-wrap") o.wrap = false;
+        else if (a == "--copy-b") o.copy_b = true;
+        else if (a == "--nr") o.nr = number(value(), argv[0]);
+        else if (a == "--pf-every-block") o.every_block = true;
         else if (a == "--pf-pair") o.pair = true;
         else if (a == "--cols") o.cols = number(value(), argv[0]);
         else if (a == "--pf") pf = value();
@@ -540,8 +690,12 @@ options parse(int argc, char** argv)
         else usage(argv[0], a == "--help" || a == "-h" ? "" : "unknown option " + a);
     }
     if (o.sizes_kb.empty()) o.sizes_kb = {16, 256, 4096};
-    o.kinds = parse_kinds(pf.empty() ? (o.copy ? "l1" : "l1,l2,load") : pf, argv[0]);
-    o.dists = parse_dists(dist.empty() ? (o.copy ? "0,4,8,16,32" : "1,2,4,8,16,32,64") : dist,
+    if (o.copy && o.copy_b) usage(argv[0], "--copy or --copy-b, not both");
+    if (o.copy_b && o.nr != 4 && o.nr != 8 && o.nr != 14 && o.nr != 16)
+        usage(argv[0], "--nr is 4, 8, 14 or 16");
+    const bool packing = o.copy || o.copy_b;
+    o.kinds = parse_kinds(pf.empty() ? (packing ? "l1" : "l1,l2,load") : pf, argv[0]);
+    o.dists = parse_dists(dist.empty() ? (packing ? "0,4,8,16,32" : "1,2,4,8,16,32,64") : dist,
                           argv[0]);
     if (o.cols == 0) usage(argv[0], "--cols must be positive");
     return o;
@@ -655,6 +809,67 @@ int copy_mode(const options& o, double scale, const char* unit)
     }
     return 0;
 }
+int copy_b_mode(const options& o, double scale, const char* unit)
+{
+    const std::size_t kc = o.cols, nr = o.nr, vl = vector_rows();
+    if (kc % vl) usage("prefetch_test", "--cols must be a multiple of the vector length here");
+    std::printf("# --copy-b: %zu-wide panels of a column-major %zu-row matrix (ldb %zu bytes),\n"
+                "# %zu rows a block, each column loaded then stored into the panel a row of\n"
+                "# %zu doubles apart; %s per source line, prefetch D lines on along each column\n"
+                "# (0: none), %s\n", nr, kc, kc * sizeof(double), vl, nr, unit,
+                o.every_block || vl * sizeof(double) >= line ? "every block"
+                                                             : "every other block (one per line)");
+    for (const std::size_t kb : o.sizes_kb)
+    {
+        const std::size_t panels = std::max<std::size_t>(1, kb * 1024 / (kc * nr * sizeof(double)));
+        const std::size_t bytes = panels * nr * kc * sizeof(double);
+        auto* b = static_cast<double*>(alloc_buffer(bytes, o.huge));
+        std::vector<double> panel(kc * nr);
+        for (std::size_t i = 0; i < panels * nr * kc; i++) b[i] = static_cast<double>(i);
+        const double items = static_cast<double>(panels * nr * kc) / (line / sizeof(double));
+        auto cost = [&](bool v, kind k, std::size_t d) {
+            if (d == 0) k = none;
+            return ns_per_item([&](long reps) {
+                DISPATCH(k, pack_b, v, nr, b, kc, panels, vl, d, o.every_block, panel.data(), reps)
+            }, items, o.min_time, o.reps) * scale;
+        };
+        const bool vec = o.vector;
+        std::printf("\n# %zu KB: %zu panels%s\n  %4s", kb, panels, huge_note(o.huge, bytes).c_str(),
+                    "D");
+        for (int f = 0; f < 2; f++)
+            if (f == 0 ? vec : o.scalar)
+                for (kind k : o.kinds)
+                    std::printf(" %10s", (std::string(f == 0 ? "vector." : "scalar.") +
+                                          kind_name[k]).c_str());
+        std::printf("\n");
+        for (const std::size_t d : o.dists)
+        {
+            std::printf("  %4zu", d);
+            for (int f = 0; f < 2; f++)
+            {
+                if (!(f == 0 ? vec : o.scalar)) continue;
+                const double base = d == 0 ? cost(f == 0, none, 0) : 0;
+                for (kind k : o.kinds) std::printf(" %10.1f", d == 0 ? base : cost(f == 0, k, d));
+            }
+            std::printf("%s\n", d == 0 ? "   (no prefetch)" : "");
+        }
+        if (o.reps > 0)
+            std::printf("# --reps %ld: each configuration packs %ld source lines\n", o.reps,
+                        (o.reps + 1) * static_cast<long>(items));
+        // the last panel must have landed
+        const double* last = b + (panels - 1) * nr * kc;
+        for (std::size_t r = 0; r < kc; r++)
+            for (std::size_t j = 0; j < nr; j++)
+                if (panel[r * nr + j] != last[r + j * kc])
+                {
+                    std::fprintf(stderr, "copy-b check failed at row %zu column %zu\n", r, j);
+                    return 1;
+                }
+        std::fflush(stdout);
+        std::free(b);
+    }
+    return 0;
+}
 }  // namespace
 
 int main(int argc, char** argv)
@@ -672,5 +887,6 @@ int main(int argc, char** argv)
     std::printf("# prefetch_test:");
     for (int i = 1; i < argc; i++) std::printf(" %s", argv[i]);
     std::printf("\n");
+    if (o.copy_b) return copy_b_mode(o, scale, unit);
     return o.copy ? copy_mode(o, scale, unit) : chase_mode(o, scale, unit);
 }

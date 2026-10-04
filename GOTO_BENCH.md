@@ -172,7 +172,10 @@ packing has four, vector loads and stores.
 | `--dist LIST` | D values: numbers and ranges `a-b` or `a-b:step` (default `1,2,4,8,16,32,64`; `--copy`: `0,4,8,16,32`) |
 | `--cols N` | `--copy`: columns per panel, a k_c (240); groups of four, leftovers one at a time |
 | `--no-wrap` | `--copy`: aim D columns on in the same rows, past the panel's (and the matrix's) last column, as a kernel that knows only its own panel does |
-| `--pf-pair` | `--copy`: each prefetch twice, at +0 and +32 bytes, as BLIS's x60 A copy at LMUL 2 issues them |
+| `--pf-pair` | `--copy`: each prefetch twice, at +0 and +32 bytes, as BLIS's x60 A copy at LMUL 2 issued them |
+| `--copy-b` | pack as BLIS packs B instead: n_r-wide panels of a column-major matrix, a block of VL rows at a time, each column loaded along k (`vle64`), then stored into the panel a row apart (`vsse64`); `--cols` is k_c, D counts lines along each column |
+| `--nr N` | `--copy-b`: panel width, 4, 8, 14 or 16 (14) |
+| `--pf-every-block` | `--copy-b`: prefetch in every block -- twice per line when a block is shorter than one, as BLIS's x60 B packing did before one prefetch per line |
 | `--flavor F` | `--copy`: `vector`, `scalar` or `both` |
 | `--reps N` | fixed repetitions instead of `--min-time`, and the lines or columns each configuration touches: wrap one configuration in `perf stat` and count per line |
 | `--huge` | transparent huge pages for the buffer, reporting how much the process holds in them (`/sys/kernel/mm/transparent_hugepage/enabled` must allow `madvise`) |
@@ -288,6 +291,13 @@ problems it took. A run is flagged when C's leading dimension makes a tile's
 columns (rows, for row-major C) share L1 sets beyond the associativity: with
 ldc = 512 doubles, the 14 columns of an 8x14 tile fall in two set groups of a
 32 KB 4-way L1, seven lines per set, and evict each other on every call.
+
+`run --sum NAME=EV1+EV2` adds measured events up and compares the sum with the
+model's `NAME`, for what a core counts apart and the model counts as one: the
+SpacemiT X60's `L1D_CACHE_REFILL` counts demand misses only, its hardware
+prefetcher's fills going to `L1D_HW_PREFETCH_REFILL`, so there
+`--sum L1D_CACHE_REFILL=L1D_CACHE_REFILL+L1D_HW_PREFETCH_REFILL` is the L1
+fill count the model predicts.
 
 `run --only EVENT...` measures a subset of `--events-map`: long runs pay one
 pass per group, so a full map of 35 events at `--group 4` runs each
