@@ -475,6 +475,12 @@ def cmd_run(a):
     if a.events_map:
         with open(a.events_map) as f:
             emap = json.load(f)
+        if a.only:
+            want = {x.upper() for x in a.only}
+            unknown = want - set(emap)
+            if unknown:
+                raise SystemExit(f"--only: not in {a.events_map}: {', '.join(sorted(unknown))}")
+            emap = {c: s for c, s in emap.items() if c in want}
         events_file = tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False)
         events_file.write('\n'.join(emap.values()) + '\n')
         events_file.close()
@@ -696,7 +702,12 @@ def main(argv=None):
                    help="vector length in bytes, for the model's L1D_CACHE uop counts: "
                         "64 for SME or AVX-512, 32 for AVX2 or 256-bit RVV, 16 for NEON")
     r.add_argument('--events-map', help='events.json from probe_events.py')
-    r.add_argument('--group', type=int, default=4)
+    r.add_argument('--group', type=int, default=4,
+                   help='events per counter group; each group is its own pass over '
+                        'the region, so passes = 1 + ceil(events / GROUP)')
+    r.add_argument('--only', nargs='+', metavar='EVENT',
+                   help='measure only these events of --events-map: fewer passes '
+                        'for long runs')
     r.add_argument('--no-steady', action='store_true',
                    help='model regions below jc against the full hierarchy')
     r.add_argument('--per-kstep', action='store_true',

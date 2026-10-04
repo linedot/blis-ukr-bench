@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -427,7 +428,7 @@ int main(int argc, char** argv)
 
     std::vector<double> ns;
     std::vector<event_result> results;
-    std::vector<double> cycles_min;
+    std::vector<double> cycles_min, cycles_overhead;
     for (const auto& g : groups)
     {
 #if defined(GOTOBENCH_HAVE_COUNTERS)
@@ -439,6 +440,31 @@ int main(int argc, char** argv)
             {
                 std::fprintf(stderr, "# warning: counters %s unavailable (%s); timing only\n",
                              g.size() > 1 ? "group" : g[0].c_str(), e.what());
+            }
+        }
+        // What starting, stopping and reading the group costs, counted by the
+        // group itself: measured around an empty body, subtracted below. Small
+        // where the counters leave kernel time out; where they cannot -- the
+        // fixed cycle and instruction counters of RISC-V cores without
+        // Smcntrpmf count the kernel's and the firmware's part of every start
+        // and stop -- it is microseconds per measurement, several percent of
+        // the ~200 us a short region's batch takes.
+        std::map<std::string, double> base;
+        if (pc)
+        {
+            performance_counters* po = nullptr;
+            try { po = new performance_counters(g); }
+            catch (const std::exception&) { po = nullptr; }
+            if (po)
+            {
+                auto nothing = [] {};
+                for (int r = 0; r < 33; r++) { po->tic(); (void)time_ns(nothing); po->toc_stat(); }
+                for (const auto& [name, mn, avg, mx] : po->get_counter_statistics())
+                {
+                    (void)avg; (void)mx;
+                    base[name] = static_cast<double>(mn);
+                }
+                delete po;
             }
         }
         for (long r = 0; r < reps + (pc ? 1 : 0); r++)   // the backend drops a pass's first
@@ -453,8 +479,15 @@ int main(int argc, char** argv)
             for (const auto& [name, mn, avg, mx] : pc->get_counter_statistics())
             {
                 (void)mx;
-                if (name == o.cycles_event) cycles_min.push_back(static_cast<double>(mn));
-                else results.push_back({name, static_cast<double>(mn), static_cast<double>(avg)});
+                const double b = base.count(name) ? base[name] : 0.0;
+                const double mn_c = std::max(0.0, static_cast<double>(mn) - b);
+                const double avg_c = std::max(0.0, static_cast<double>(avg) - b);
+                if (name == o.cycles_event)
+                {
+                    cycles_min.push_back(mn_c);
+                    cycles_overhead.push_back(b);
+                }
+                else results.push_back({name, mn_c, avg_c});
             }
             delete pc;
         }
@@ -488,6 +521,10 @@ int main(int argc, char** argv)
     std::printf("# compiler: %s\n", __VERSION__);
     std::printf("# cache line: %zu\n", o.cfg.line);
     std::printf("# footprint: %zu bytes\n", nest->footprint_bytes());
+    if (!cycles_overhead.empty())
+        std::printf("# counter overhead: %.0f cycles per measurement of %ld region runs, "
+                    "subtracted (%.2f per run)\n", cycles_overhead.front(), inner,
+                    cycles_overhead.front() / inner);
     for (const auto& s : o.cfg.prefetches)
         std::printf("# prefetch %s -> %s\n", s.text.c_str(), describe(s.kind).c_str());
 

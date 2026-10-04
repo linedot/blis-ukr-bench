@@ -76,7 +76,17 @@ Options
   cycle counter: one group with more events than the PMU has counters would
   never be scheduled. Each event is first opened on its own beside the cycle
   counter; one the kernel refuses is skipped with a warning naming it, so it
-  costs neither the rest of its group nor the cycles.
+  costs neither the rest of its group nor the cycles. A cycles-only pass comes
+  first, so a run takes 1 + ceil(events / N) passes, each `reps` measurements
+  of `inner` region runs; each event reports its own pass's minimum. A group
+  the PMU cannot hold at once is reported as multiplexed. What starting,
+  stopping and reading a group costs is measured around an empty body and
+  subtracted from every count (`# counter overhead` in the header): tens of
+  cycles where counters leave out kernel time, microseconds where they cannot
+  -- the fixed cycle and instruction counters of RISC-V cores without
+  Smcntrpmf count the kernel's and firmware's part of each start and stop,
+  which inflated short regions' cycles by 3-9% on the SpacemiT K1 (a 1.6 GHz
+  clock read as 1.65-1.75 GHz, while seconds-long runs read 1.60).
 * `--reps N` / `--min-time S`, `--warmup N`, `--inner N` -- `inner` repeats
   the region inside each timed measurement (default: enough for ~200 us), so
   small regions are not timer-bound. Every reported value is per region run.
@@ -221,6 +231,10 @@ columns (rows, for row-major C) share L1 sets beyond the associativity: with
 ldc = 512 doubles, the 14 columns of an 8x14 tile fall in two set groups of a
 32 KB 4-way L1, seven lines per set, and evict each other on every call.
 
+`run --only EVENT...` measures a subset of `--events-map`: long runs pay one
+pass per group, so a full map of 36 events at `--group 4` runs each
+configuration ten times over.
+
 `run --per-kstep` splits cycles and every counter, per call, into a fixed part
 and a part per k-step, fitted per problem and region over runs that differ
 only in the k each call runs, min(k_c, k) (Theil-Sen:
@@ -305,6 +319,11 @@ k-loop: a prefetch issued at the call's start, as BLIS's
 armv8a 8x6 dgemm kernel does for its C rows (`ir:C:L1:keep:k`). AOCL's 8x24
 dgemm kernel prefetches its C tile only once k/4 exceeds its 24-iteration
 tail, i.e. for k_c >= 128, then 100-128 k-steps ahead: `ir:C:L1:keep:100@128`.
+The SpacemiT X60's 2vx14 dgemm kernel (k unrolled by 2) issues `prefetch.w`
+for its 14 C columns when 7 iterations remain, i.e. 14 k-steps ahead, from
+k >= 18: `ir:C:L1:keep:14@18`. It loads B as scalars for `vfmacc.vf`, one load
+per element, which the model counts as a broadcast (`--bcast B`); its 256-bit
+`vle64` count two L1 accesses each, so its loads are counted at `--vl 16`.
 Below that it prefetches nothing, so its C fetch is exposed every call.
 
 The model charges that exposed fetch in series with the k-loop: the C tile's
