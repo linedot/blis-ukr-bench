@@ -79,14 +79,17 @@ Options
   costs neither the rest of its group nor the cycles. A cycles-only pass comes
   first, so a run takes 1 + ceil(events / N) passes, each `reps` measurements
   of `inner` region runs; each event reports its own pass's minimum. A group
-  the PMU cannot hold at once is reported as multiplexed. What starting,
-  stopping and reading a group costs is measured around an empty body and
-  subtracted from every count (`# counter overhead` in the header): tens of
-  cycles where counters leave out kernel time, microseconds where they cannot
-  -- the fixed cycle and instruction counters of RISC-V cores without
-  Smcntrpmf count the kernel's and firmware's part of each start and stop,
-  which inflated short regions' cycles by 3-9% on the SpacemiT K1 (a 1.6 GHz
-  clock read as 1.65-1.75 GHz, while seconds-long runs read 1.60).
+  the PMU cannot hold at once is reported as multiplexed. A group counts from
+  when it is opened; each measurement reads it before and after the timed
+  body, two read() system calls. What they cost the counts is measured around
+  an empty body, by an instance of the group opened and closed beforehand (two
+  at once may not fit: RISC-V has one cycle counter), and subtracted from
+  every count (`# counter overhead` in the header): tens of cycles where the
+  counters leave out kernel time, microseconds where they cannot -- the fixed
+  cycle and instruction counters of RISC-V cores without Smcntrpmf count the
+  kernel's part of each read, which inflated short regions' cycles by 3-9% on
+  the SpacemiT K1 (a 1.6 GHz clock read as 1.65-1.75 GHz, while seconds-long
+  runs read 1.60).
 * `--reps N` / `--min-time S`, `--warmup N`, `--inner N` -- `inner` repeats
   the region inside each timed measurement (default: enough for ~200 us), so
   small regions are not timer-bound. Every reported value is per region run.

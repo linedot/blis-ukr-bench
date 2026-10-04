@@ -432,25 +432,18 @@ int main(int argc, char** argv)
     for (const auto& g : groups)
     {
 #if defined(GOTOBENCH_HAVE_COUNTERS)
-        performance_counters* pc = nullptr;
-        if (!g.empty())
-        {
-            try { pc = new performance_counters(g); }
-            catch (const std::exception& e)
-            {
-                std::fprintf(stderr, "# warning: counters %s unavailable (%s); timing only\n",
-                             g.size() > 1 ? "group" : g[0].c_str(), e.what());
-            }
-        }
-        // What starting, stopping and reading the group costs, counted by the
-        // group itself: measured around an empty body, subtracted below. Small
-        // where the counters leave kernel time out; where they cannot -- the
+        // What a measurement costs the counters themselves: the backend counts
+        // from the group's construction and reads it before and after the
+        // timed body -- two read() system calls whose kernel part lands in
+        // the count wherever the counters cannot leave kernel time out (the
         // fixed cycle and instruction counters of RISC-V cores without
-        // Smcntrpmf count the kernel's and the firmware's part of every start
-        // and stop -- it is microseconds per measurement, several percent of
-        // the ~200 us a short region's batch takes.
+        // Smcntrpmf): microseconds, several percent of the ~200 us a short
+        // region's measurement takes.  Measured around an empty body with an
+        // instance of its own, gone before the measurement's is opened -- two
+        // at once may not fit (RISC-V has one cycle counter) -- and
+        // subtracted below.
         std::map<std::string, double> base;
-        if (pc)
+        if (!g.empty())
         {
             performance_counters* po = nullptr;
             try { po = new performance_counters(g); }
@@ -464,7 +457,17 @@ int main(int argc, char** argv)
                     (void)avg; (void)mx;
                     base[name] = static_cast<double>(mn);
                 }
-                delete po;
+                delete po;      // disables the group: its counters are free again
+            }
+        }
+        performance_counters* pc = nullptr;
+        if (!g.empty())
+        {
+            try { pc = new performance_counters(g); }
+            catch (const std::exception& e)
+            {
+                std::fprintf(stderr, "# warning: counters %s unavailable (%s); timing only\n",
+                             g.size() > 1 ? "group" : g[0].c_str(), e.what());
             }
         }
         for (long r = 0; r < reps + (pc ? 1 : 0); r++)   // the backend drops a pass's first
