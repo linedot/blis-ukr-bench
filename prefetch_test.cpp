@@ -51,6 +51,10 @@
 //   --nr N        --copy-b: panel width, 4, 8, 14 or 16 (14)
 //   --pf-every-block  --copy-b: prefetch in every block -- twice per line
 //                 when a block is shorter than one, as BLIS's x60 B packing did
+//   --dest-fresh  --copy-b: each panel into its own region of a B_c-sized
+//                 buffer, as BLIS packs, instead of one panel buffer reused
+//   --pf-dest D   --copy-b: prefetch.w the panel D lines ahead of the block
+//                 being written, once per line
 //   --reps N      fixed repetitions instead of --min-time, so that perf stat
 //                 around one configuration counts known work; prints how many
 //                 lines (chase) or columns (copy) each configuration touches
@@ -60,6 +64,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -513,21 +518,36 @@ inline void b_block(const char* src, std::size_t ldb, std::size_t vl, long pfoff
 // column, once per line: with blocks shorter than a line it alternates every
 // block with -64, the line just read, as the BLIS x60 kernel does -- unless
 // `every_block`, the scheme that prefetched each line twice.
+// With `fresh`, each panel goes to its own region of `panel` (panels x kc x
+// n_r doubles), as BLIS fills B_c; otherwise one panel buffer is reused, which
+// stays in L1 while it fits. With `dest_ahead` > 0, prefetch.w each line of the
+// panel that many lines ahead of the block being written, once per line.
 template <kind K, int NR, bool vec>
 void pack_b_all(const double* b, std::size_t kc, std::size_t panels, std::size_t vl,
-                std::size_t dist, bool every_block, double* panel, long reps)
+                std::size_t dist, bool every_block, double* panel, long reps, bool fresh,
+                std::size_t dest_ahead)
 {
     const std::size_t ldb = kc * sizeof(double), block_bytes = vl * sizeof(double);
     const long ahead = static_cast<long>(dist * line);
     const bool alternate = !every_block && block_bytes < line;
+    const std::size_t dest_block = vl * NR * sizeof(double), dest_off = dest_ahead * line;
     for (long r = 0; r < reps; r++)
         for (std::size_t q = 0; q < panels; q++)
         {
             const char* col0 = reinterpret_cast<const char*>(b + q * NR * kc);
+            double* dst = fresh ? panel + q * NR * kc : panel;
             long pfoff = ahead;
             for (std::size_t p = 0; p < kc; p += vl)
             {
-                b_block<K, NR, vec>(col0 + p * sizeof(double), ldb, vl, pfoff, panel + p * NR);
+                if (dest_ahead)
+                {
+                    // the lines starting in [start, start + block): each once
+                    const auto start = reinterpret_cast<std::uintptr_t>(dst + p * NR) + dest_off;
+                    for (std::uintptr_t a = (start + line - 1) / line * line; a < start + dest_block;
+                         a += line)
+                        touch<pf_w>(reinterpret_cast<const void*>(a));
+                }
+                b_block<K, NR, vec>(col0 + p * sizeof(double), ldb, vl, pfoff, dst + p * NR);
                 if (alternate) pfoff = pfoff == ahead ? -static_cast<long>(line) : ahead;
             }
         }
@@ -535,13 +555,16 @@ void pack_b_all(const double* b, std::size_t kc, std::size_t panels, std::size_t
 
 template <kind K>
 void pack_b(bool vec, std::size_t nr, const double* b, std::size_t kc, std::size_t panels,
-            std::size_t vl, std::size_t dist, bool every_block, double* panel, long reps)
+            std::size_t vl, std::size_t dist, bool every_block, double* panel, long reps,
+            bool fresh, std::size_t dest_ahead)
 {
 #define PACK_B_NR(N)                                                                          \
     if (nr == N)                                                                              \
     {                                                                                         \
-        if (vec) pack_b_all<K, N, true>(b, kc, panels, vl, dist, every_block, panel, reps);   \
-        else pack_b_all<K, N, false>(b, kc, panels, vl, dist, every_block, panel, reps);      \
+        if (vec) pack_b_all<K, N, true>(b, kc, panels, vl, dist, every_block, panel, reps,    \
+                                        fresh, dest_ahead);                                   \
+        else pack_b_all<K, N, false>(b, kc, panels, vl, dist, every_block, panel, reps,       \
+                                     fresh, dest_ahead);                                      \
         return;                                                                               \
     }
     PACK_B_NR(4) PACK_B_NR(8) PACK_B_NR(14) PACK_B_NR(16)
@@ -569,7 +592,8 @@ struct options
     double ghz = 0, min_time = 0.1;
     long reps = 0;
     bool huge = false, copy = false, wrap = true, pair = false;
-    bool copy_b = false, every_block = false;
+    bool copy_b = false, every_block = false, dest_fresh = false;
+    std::size_t dest_ahead = 0;
     std::size_t nr = 14;
     std::size_t cols = 240;
     bool vector = true, scalar = true;
@@ -583,7 +607,7 @@ struct options
     std::fprintf(stderr,
                  "usage: %s [--pf l1,l2,l3,nta,w,load] [--dist LIST] [--copy] [--cols N]\n"
                  "       [--flavor vector|scalar|both] [--no-wrap] [--pf-pair] [--copy-b]\n"
-                 "       [--nr N] [--pf-every-block] [--reps N]\n"
+                 "       [--nr N] [--pf-every-block] [--dest-fresh] [--pf-dest D] [--reps N]\n"
                  "       [--huge] [--cpu N] [--ghz G] [--min-time S] [SIZE_KB...]\n", argv0);
     std::exit(1);
 }
@@ -674,6 +698,8 @@ options parse(int argc, char** argv)
         else if (a == "--copy-b") o.copy_b = true;
         else if (a == "--nr") o.nr = number(value(), argv[0]);
         else if (a == "--pf-every-block") o.every_block = true;
+        else if (a == "--dest-fresh") o.dest_fresh = true;
+        else if (a == "--pf-dest") o.dest_ahead = number(value(), argv[0]);
         else if (a == "--pf-pair") o.pair = true;
         else if (a == "--cols") o.cols = number(value(), argv[0]);
         else if (a == "--pf") pf = value();
@@ -816,21 +842,27 @@ int copy_b_mode(const options& o, double scale, const char* unit)
     std::printf("# --copy-b: %zu-wide panels of a column-major %zu-row matrix (ldb %zu bytes),\n"
                 "# %zu rows a block, each column loaded then stored into the panel a row of\n"
                 "# %zu doubles apart; %s per source line, prefetch D lines on along each column\n"
-                "# (0: none), %s\n", nr, kc, kc * sizeof(double), vl, nr, unit,
+                "# (0: none), %s; %s%s\n", nr, kc, kc * sizeof(double), vl, nr, unit,
                 o.every_block || vl * sizeof(double) >= line ? "every block"
-                                                             : "every other block (one per line)");
+                                                             : "every other block (one per line)",
+                o.dest_fresh ? "each panel to its own region (as B_c)" : "one panel buffer reused",
+                o.dest_ahead ? (", prefetch.w of the panel " + std::to_string(o.dest_ahead) +
+                                " lines ahead").c_str() : "");
     for (const std::size_t kb : o.sizes_kb)
     {
         const std::size_t panels = std::max<std::size_t>(1, kb * 1024 / (kc * nr * sizeof(double)));
         const std::size_t bytes = panels * nr * kc * sizeof(double);
         auto* b = static_cast<double*>(alloc_buffer(bytes, o.huge));
-        std::vector<double> panel(kc * nr);
+        // a panel buffer reused for every panel, or B_c-sized: a fresh region each
+        auto* panel = static_cast<double*>(alloc_buffer(
+            (o.dest_fresh ? panels : 1) * kc * nr * sizeof(double), o.huge));
         for (std::size_t i = 0; i < panels * nr * kc; i++) b[i] = static_cast<double>(i);
         const double items = static_cast<double>(panels * nr * kc) / (line / sizeof(double));
         auto cost = [&](bool v, kind k, std::size_t d) {
             if (d == 0) k = none;
             return ns_per_item([&](long reps) {
-                DISPATCH(k, pack_b, v, nr, b, kc, panels, vl, d, o.every_block, panel.data(), reps)
+                DISPATCH(k, pack_b, v, nr, b, kc, panels, vl, d, o.every_block, panel, reps,
+                         o.dest_fresh, o.dest_ahead)
             }, items, o.min_time, o.reps) * scale;
         };
         const bool vec = o.vector;
@@ -858,15 +890,17 @@ int copy_b_mode(const options& o, double scale, const char* unit)
                         (o.reps + 1) * static_cast<long>(items));
         // the last panel must have landed
         const double* last = b + (panels - 1) * nr * kc;
+        const double* landed = o.dest_fresh ? panel + (panels - 1) * nr * kc : panel;
         for (std::size_t r = 0; r < kc; r++)
             for (std::size_t j = 0; j < nr; j++)
-                if (panel[r * nr + j] != last[r + j * kc])
+                if (landed[r * nr + j] != last[r + j * kc])
                 {
                     std::fprintf(stderr, "copy-b check failed at row %zu column %zu\n", r, j);
                     return 1;
                 }
         std::fflush(stdout);
         std::free(b);
+        std::free(panel);
     }
     return 0;
 }

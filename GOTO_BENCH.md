@@ -176,6 +176,8 @@ packing has four, vector loads and stores.
 | `--copy-b` | pack as BLIS packs B instead: n_r-wide panels of a column-major matrix, a block of VL rows at a time, each column loaded along k (`vle64`), then stored into the panel a row apart (`vsse64`); `--cols` is k_c, D counts lines along each column |
 | `--nr N` | `--copy-b`: panel width, 4, 8, 14 or 16 (14) |
 | `--pf-every-block` | `--copy-b`: prefetch in every block -- twice per line when a block is shorter than one, as BLIS's x60 B packing did before one prefetch per line |
+| `--dest-fresh` | `--copy-b`: each panel into its own region of a B_c-sized buffer, as BLIS packs, instead of one panel buffer reused -- which stays in L1 while it fits |
+| `--pf-dest D` | `--copy-b`: `prefetch.w` the panel D lines ahead of the block being written, once per line |
 | `--flavor F` | `--copy`: `vector`, `scalar` or `both` |
 | `--reps N` | fixed repetitions instead of `--min-time`, and the lines or columns each configuration touches: wrap one configuration in `perf stat` and count per line |
 | `--huge` | transparent huge pages for the buffer, reporting how much the process holds in them (`/sys/kernel/mm/transparent_hugepage/enabled` must allow `madvise`) |
