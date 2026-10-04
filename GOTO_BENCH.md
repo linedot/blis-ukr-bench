@@ -142,6 +142,26 @@ probe_events.py --include 'l2_a[rw]_channel|lsu|vlsu' --write events
 probe_events.py --perf-json saved.json   # perf list -j saved elsewhere
 ```
 
+`prefetch_test` answers whether a software prefetch reaches L1 on a core, and
+how far ahead it must go, without BLIS or counters:
+
+```
+build/prefetch_test --cpu 5 --ghz 1.6 16 256 4096 [--huge]
+```
+
+It walks a buffer's 64-byte lines in a random order, which no hardware
+prefetcher follows, each line holding the index of the next: a pointer chase,
+so every miss costs its full latency. `chase` is that latency for the level
+the buffer lives in. The same walk with a prefetch D lines ahead -- `pf.L1`
+(RISC-V `prefetch.r`, x86 `prefetcht0`, AArch64 `prfm pldl1keep`), `pf.L2`
+(`ntl.p1` + `prefetch.r`, `prefetcht1`, `pldl2keep`), or `load`, a plain load
+whose value is discarded (`ld x0`) -- falls to the L1 row's cost once D steps
+cover the latency. `pf.L1` no better than `chase` at any D means the core
+ignores the prefetch (Zicbop allows that); `load` better than `pf.L1` means it
+drops prefetches but not loads. An out-of-order core runs ahead and hides D; on
+an in-order one the D where a column flattens is the distance needed. `--huge`
+asks for transparent huge pages, keeping TLB misses out of the larger sizes.
+
 perf's own errors can land in the middle of its JSON (`Error: failed to open
 tracing events directory` before the closing bracket); the probe then parses
 entry by entry. perf's tables call the core PMU `default_core` whatever sysfs

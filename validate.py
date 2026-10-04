@@ -442,13 +442,14 @@ def c_aliasing(ld, count, L1):
     """
     How many of a C tile's `count` columns (rows, for row-major C), `ld`
     elements apart, land in each L1 set: above the associativity they evict
-    each other on every call.  0 when they fit.
+    each other on every call; at it they fill every way, so any A or B line
+    in those sets evicts C.  0 when they leave room.
     """
     if not L1.assoc or not math.isfinite(L1.size):
         return 0
     way = int(L1.size) // L1.assoc
     per_set = math.ceil(count / (way // math.gcd(8 * ld, way)))
-    return per_set if per_set > L1.assoc else 0
+    return per_set if per_set >= L1.assoc else 0
 
 
 def parse_size(s):
@@ -541,9 +542,11 @@ def cmd_run(a):
         ld, count = (m, u.n_r) if a.c_layout == 'cm' else (n, u.m_r)
         per_set = c_aliasing(ld, count, lev[0])
         if per_set:
+            what = ('conflict misses on every call' if per_set > lev[0].assoc else
+                    'C fills every way, so A and B lines there evict it')
             flags.append(f"C's leading dimension {ld} puts {per_set} of a tile's {count} "
                          f"{'columns' if a.c_layout == 'cm' else 'rows'} in each L1 set "
-                         f"({lev[0].assoc}-way): conflict misses on every call")
+                         f"({lev[0].assoc}-way): {what}")
         b = model.blocking(kc, mc, nc)
         p = model.problem(me, ne, ke)
         kc_mean = ke / math.ceil(ke / kc)
