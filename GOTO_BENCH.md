@@ -177,11 +177,11 @@ Validating the model: validate.py
 
 ```
 validate.py detect-cache                              # sizes/lines/ways from sysfs
-validate.py calibrate --bench build/goto_bench [--ghz G] -o calib.json
+validate.py calibrate --bench build/goto_bench [--ghz G] [--c-layout cm] -o calib.json
 validate.py run --bench build/goto_bench --calib calib.json \
     --cache <model.py spec for this machine> \
     --size 2000 4000 --kc 128 256 --mc 96 --nc 4096 --top jc \
-    [--prefetch ir:C:L2] [--events-map events.json] -o results.csv
+    [--prefetch ir:C:L2] [--events-map events.json] [--per-kstep] -o results.csv
 ```
 
 `calibrate` fits the micro-kernel at k small enough to stay in L1 as
@@ -190,8 +190,42 @@ model charges as its epilogue -- leaving out k < 8, where the per-call work
 overlaps the short k-loop differently, and any point more than 2% off the
 line while three remain (a fitted peak above the hardware's is the sign of
 one). `--peak` fixes the slope when the peak is known, so that only C is
-fitted; then times one A_c and one B_c pack in
-cache for `--pack-rate`. It also times one `ir` loop in L1 at two k. With
+fitted. It then times A_c and B_c packs three times each: with source and
+packed copy in L1, in L2, and with the source in memory (4x the last level's
+size, at most 64 MB), all sized from sysfs (`--l1`, `--l2` override). The L1
+rate is the pack kernel's own cost and becomes `--pack-rate`: the model adds
+where the source lives through its memory terms. The L2 and memory rates show
+what each level costs on top. An out-of-order core keeps them close to the L1
+rate; an in-order core stalls on every miss not prefetched, so its rates fall
+to one line per latency -- on the SpacemiT X60, 0.21 elements/cycle with A in
+L2 and 0.033 with B from memory, against ~1 in L1. It also times one `ir`
+loop in L1 at two k.
+
+`--c-layout` matters most here: a kernel given the C layout it does not prefer
+may move C element by element or through a temporary tile. goto_bench prints
+the kernel's preference; calibrate with the layout you run (`run` warns when
+they differ).
+
+`run --per-kstep` splits cycles and every counter, per call, into a fixed part
+and a part per k-step, fitted over runs that differ only in k_c (Theil-Sen:
+the median of pairwise slopes, so one run in another regime does not tilt the
+line, and runs more than 10% off it are listed). The per-k-step part is the
+k-loop's; the fixed part is the C update, the call, a prefetch hook. On the
+X60's 8x14 dgemm kernel with row-major C:
+
+```
+                                 per k-step   per call
+  cycles                              36.99       2092   = 6.06 FLOP/cycle in the k-loop
+  INST_RETIRED                        51.05       1905
+  L1D_CACHE_RD                        18.05        486
+  L1D_CACHE_WR                         0.03        284
+  LSU_LOAD_WAW_STALL                  12.50        740
+  VIDU_VEC1_STRUCT_HAZARD_STALL        1.83        499
+```
+
+-- a third of the k-loop lost to load write-after-write stalls (a load to a
+register an earlier write still holds: too few scalar registers rotated for
+B), and ~2000 cycles per call around it. With
 `--events-map`, the intercepts of loads and stores per call against k, less
 the C tile's, become the default `--call-uops`, and the slope is printed as
 loads per k-step, with the `--bcast` it matches. With `--prefetch`, the same

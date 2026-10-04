@@ -51,6 +51,7 @@ import json
 import math
 import os
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -131,9 +132,48 @@ def cmd_detect_cache(_):
     return 0
 
 
+def theil_sen(xs, ys):
+    """Line through (x, y): median pairwise slope, so one run off the line does not tilt it."""
+    slopes = [(ys[j] - ys[i]) / (xs[j] - xs[i])
+              for i in range(len(xs)) for j in range(i + 1, len(xs)) if xs[j] != xs[i]]
+    b = statistics.median(slopes)
+    return statistics.median(y - b * x for x, y in zip(xs, ys)), b
+
+
+def per_kstep_table(results, mr, nr):
+    """
+    Per call = fixed + per k-step x k_c, for cycles and every counter, over runs
+    that differ only in k_c. The k-step part is the k-loop's; the fixed part is
+    everything once per call -- the C update, the call itself, a prefetch hook.
+    """
+    groups = {}
+    for r in results:
+        groups.setdefault((r['top'], r['m'], r['n'], r['mc'], r['nc']), []).append(r)
+    for (top, *_), rs in groups.items():
+        ks = sorted({r['kc'] for r in rs})
+        if len(ks) < 3:
+            continue
+        print(f"# per call = fixed + per k-step x k_c: top {top}, {len(rs)} runs, "
+              f"k_c {ks[0]}-{ks[-1]}")
+        print(f"  {'':<30} {'per k-step':>10} {'per call':>10}   off the line by over 10%")
+        cols = ['measured_cycles'] + [c for c in rs[0] if c.endswith('_measured')]
+        for col in cols:
+            pts = [(r['kc'], r[col] / r['calls']) for r in rs if col in r and r['calls']]
+            if len(pts) < 3:
+                continue
+            c0, b = theil_sen([k for k, _ in pts], [y for _, y in pts])
+            off = [f"{k} ({(y - c0 - b * k) / y:+.0%})" for k, y in pts
+                   if y and abs(y - c0 - b * k) > 0.1 * abs(y) and abs(y - c0 - b * k) > 5]
+            name = 'cycles' if col == 'measured_cycles' else col[:-len('_measured')]
+            note = (f"   = {2 * mr * nr / b:.2f} FLOP/cycle in the k-loop"
+                    if col == 'measured_cycles' and b > 0 else '')
+            print(f"  {name:<30} {b:10.2f} {c0:10.0f}   {', '.join(off)}{note}")
+
+
 def cmd_calibrate(a):
     meta, _ = run_bench(a.bench, ['--size', 64, 64, 64, '--kc', 16, '--mc', 64, '--nc', 64,
-                                  '--top', 'ukr', '--reps', 3, '--beta', a.beta])
+                                  '--top', 'ukr', '--reps', 3, '--beta', a.beta,
+                                  '--c-layout', a.c_layout])
     mr, nr = (int(x) for x in meta['ukr size'].split()[0].split('x'))
     l1 = a.l1 or next((sz for lv, sz, _, _ in sysfs_caches() if lv == 1), 32 * 1024)
     kmax = max(8, (l1 // 2 - 8 * mr * nr) // (8 * (mr + nr)))
@@ -144,8 +184,8 @@ def cmd_calibrate(a):
     pts, src = [], ''
     for k in ks:
         _, row = run_bench(a.bench, ['--size', mr, nr, k, '--kc', k, '--mc', mr, '--nc', nr,
-                                     '--top', 'ukr', '--min-time', a.min_time, '--beta', a.beta]
-                           + a.extra)
+                                     '--top', 'ukr', '--min-time', a.min_time, '--beta', a.beta,
+                                     '--c-layout', a.c_layout] + a.extra)
         cyc, src = cycles(row, a.ghz)
         pts.append((k, cyc))
         print(f"  k={k:>5}: {cyc:9.1f} cycles per call")
@@ -186,16 +226,37 @@ def cmd_calibrate(a):
         print("  # warning: the points do not lie on a line -- rerun with a longer "
               "--min-time, or give --peak")
 
-    rates = {}
-    for op, top, size, blk in (('A', 'packA', (8 * mr, 64, 256), (256, 8 * mr, 64)),
-                               ('B', 'packB', (64, 32 * nr, 256), (256, 64, 32 * nr))):
-        _, row = run_bench(a.bench, ['--size', *size, '--kc', blk[0], '--mc', blk[1], '--nc', blk[2],
-                                     '--top', top, '--min-time', a.min_time])
-        cyc, src = cycles(row, a.ghz)
-        rates[op] = float(row['work']) / cyc
-        print(f"  pack {op}: {rates[op]:.2f} elements/cycle  ({int(float(row['work']))} elements in cache)")
+    # Pack rates with source and packed copy in L1, in L2, and the source from
+    # memory (4x the last level, at most 64 MB). The L1 rate is the pack
+    # kernel's own cost, which the model takes: its memory terms add where the
+    # source lives. The others show what each level costs on top -- on an
+    # in-order core, every miss not prefetched stalls for its full latency.
+    caches = sysfs_caches()
+    l2 = a.l2 or next((sz for lv, sz, _, _ in caches if lv == 2), 1 << 20)
+    llc = max([sz for _, sz, _, _ in caches] + [l2])
+    places = (('L1', l1 // 24), ('L2', l2 // 24), ('memory', min(4 * llc, 64 << 20) // 8))
+    rates, by_level = {}, {}
+    print("# pack kernels, elements/cycle with source and packed copy in:")
+    for op, top, w in (('A', 'packA', mr), ('B', 'packB', nr)):
+        by_level[op] = {}
+        for where, elems in places:
+            kc = min(256, max(8, elems // w // 8 * 8))
+            width = max(w, elems // kc // w * w)
+            size, blk = (((width, 64, kc), (kc, width, 64)) if op == 'A' else
+                         ((64, width, kc), (kc, 64, width)))
+            _, row = run_bench(a.bench, ['--size', *size, '--kc', blk[0], '--mc', blk[1],
+                                         '--nc', blk[2], '--top', top,
+                                         '--min-time', a.min_time] + a.extra)
+            cyc, src = cycles(row, a.ghz)
+            by_level[op][where] = float(row['work']) / cyc
+        rates[op] = by_level[op]['L1']
+        lv = by_level[op]
+        print(f"  pack {op}: " + ', '.join(f"{lv[w]:.3g} {w}" for w, _ in places)
+              + (f"   (from memory {lv['L1'] / lv['memory']:.0f}x slower than L1: "
+                 "latency exposed)" if lv['memory'] < 0.25 * lv['L1'] else ""))
 
     calib = {'mr': mr, 'nr': nr, 'impl': meta.get('ukr implementation', ''), 'beta': a.beta,
+             'c_layout': a.c_layout, 'pack_rates': by_level,
              'peak': peak, 'epi_cycles': c0, 'ukr_points': pts, 'fit_worst_residual': worst,
              'pack_rate_a': rates['A'], 'pack_rate_b': rates['B'], 'cycles_source': src,
              'ghz': a.ghz}
@@ -230,7 +291,8 @@ def calibrate_in_nest(a, mr, nr, l1):
 
     def per_call(k, pf):
         args = ['--size', 4 * mr, nr, k, '--kc', k, '--mc', 4 * mr, '--nc', nr, '--top', 'ir',
-                '--beta', a.beta, '--min-time', a.min_time] + ev_args + a.extra
+                '--beta', a.beta, '--c-layout', a.c_layout,
+                '--min-time', a.min_time] + ev_args + a.extra
         if pf:
             args += ['--prefetch'] + pf
         _, row = run_bench(a.bench, args)
@@ -327,6 +389,9 @@ def parse_size(s):
 def cmd_run(a):
     with open(a.calib) as f:
         calib = json.load(f)
+    if calib.get('c_layout', 'rm') != a.c_layout:
+        print(f"# warning: calibrated with --c-layout {calib.get('c_layout', 'rm')}, running "
+              f"{a.c_layout}: the per-call cost may differ")
     if calib.get('beta') != a.beta:
         print(f"# warning: calibrated with --beta {calib.get('beta')}, running with {a.beta}; "
               f"the per-call cost may differ")
@@ -413,6 +478,7 @@ def cmd_run(a):
                'measured_cycles': meas, 'model_cycles': pred.time,
                'measured_flop_per_cycle': fm, 'model_flop_per_cycle': fp,
                'ratio': fm / fp, 'model_bound': pred.bound, 'cycles_from': src,
+               'calls': an.calls,
                'flags': '; '.join(flags)}
         if emap:
             ev = model.counters(an, a.vl).events
@@ -450,6 +516,8 @@ def cmd_run(a):
         g = math.exp(sum(math.log(x) for x in r) / len(r))
         print(f"# measured/model FLOP/cycle: geometric mean {g:.3f}, range {min(r):.3f}-{max(r):.3f}"
               f" over {len(r)} runs")
+    if a.per_kstep and results:
+        per_kstep_table(results, calib['mr'], calib['nr'])
     if a.output and results:
         keys = sorted({k for x in results for k in x}, key=lambda k: list(results[0]).index(k)
                       if k in results[0] else 999)
@@ -481,6 +549,10 @@ def main(argv=None):
                        help="pin goto_bench to this CPU (on a desktop, keep its SMT "
                             "sibling idle; on a server, avoid the CPU that takes the "
                             "interrupts, often 0)")
+        s.add_argument('--c-layout', default='rm', choices=['rm', 'cm'],
+                       help="C's layout: a kernel given the one it does not prefer may "
+                            "move C element by element (goto_bench prints the "
+                            "preference); calibrate and run with the same")
     c = sub.choices['calibrate']
     c.add_argument('-o', '--output', default='calib.json')
     c.add_argument('--prefetch', nargs='*', default=[],
@@ -496,6 +568,7 @@ def main(argv=None):
                         "slope, so only the per-call cost is fitted")
     c.add_argument('--group', type=int, default=4)
     c.add_argument('--l1', type=int, help='L1 data cache bytes (default: from sysfs)')
+    c.add_argument('--l2', type=int, help='L2 cache bytes (default: from sysfs)')
     r = sub.choices['run']
     r.add_argument('--calib', required=True)
     r.add_argument('--cache', nargs='+', required=True, metavar='LEVEL',
@@ -507,7 +580,6 @@ def main(argv=None):
     r.add_argument('--nc', nargs='+', type=int, required=True)
     r.add_argument('--top', nargs='+', default=['jc'], choices=RUNGS[:6])
     r.add_argument('--pack', default='A:ic,B:pc')
-    r.add_argument('--c-layout', default='rm', choices=['rm', 'cm'])
     r.add_argument('--prefetch', nargs='*', default=[],
                    help="prefetches goto_bench issues between calls (and the model gets)")
     r.add_argument('--kernel-prefetch', nargs='*', default=[], metavar='PF',
@@ -544,6 +616,9 @@ def main(argv=None):
     r.add_argument('--group', type=int, default=4)
     r.add_argument('--no-steady', action='store_true',
                    help='model regions below jc against the full hierarchy')
+    r.add_argument('--per-kstep', action='store_true',
+                   help='split cycles and every counter into a per-call and a '
+                        'per-k-step part, fitted over runs that differ only in k_c')
     r.add_argument('-o', '--output')
     a = p.parse_args(argv)
     global PIN
