@@ -162,6 +162,13 @@ drops prefetches but not loads. An out-of-order core runs ahead and hides D; on
 an in-order one the D where a column flattens is the distance needed. `--huge`
 asks for transparent huge pages, keeping TLB misses out of the larger sizes.
 
+`--copy` packs instead, the way BLIS packs A: 8-row panels of a column-major
+matrix, one 64-byte line per column, four columns per iteration, loaded then
+stored -- with vector loads (`vle64` at LMUL 2, VLEN >= 256) and with scalar
+`ld`/`sd`, each with `prefetch.r` D columns ahead (D = 0: none). The chase has
+one miss in flight and scalar loads; packing has four and vector loads, so a
+prefetch that helps the chase but not `--copy` points at one of those.
+
 perf's own errors can land in the middle of its JSON (`Error: failed to open
 tracing events directory` before the closing bracket); the probe then parses
 entry by entry. perf's tables call the core PMU `default_core` whatever sysfs
