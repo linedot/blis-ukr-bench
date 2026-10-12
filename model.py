@@ -17,8 +17,9 @@ Blocks are clamped to their dimension and the cache-block loops count whole
 trips, a partial last block included.  In the footprint column a block size
 is the largest block, min(block, dim), since that is what has to fit; in the
 ir and jr rows it is the mean realised block, dim / trips.  Micro-tiles are
-still counted continuously (m/m_r): padding to multiples of m_r and n_r is
-not modelled.
+whole: the micro-kernel always computes a full m_r x n_r tile, so a block that
+is not a multiple of m_r or n_r rounds up to whole tiles, block by block --
+though C is read and written only where it is real.
 
 Traffic crossing a boundary is worked out per operand.  A rung's reuse applies
 only to the operand it keeps invariant: each operand's core-side traffic is
@@ -79,12 +80,26 @@ that is paid in series with them:
 
               added to the call's compute -- in series, not as a fourth
               ceiling.  A timely prefetch into L1 removes it, one into L2
-              leaves L2's latency; `lookahead` is how far ahead of the
-              epilogue the core can already issue the C loads.  For very
-              small k_c, where the core can run the next call's whole k-loop
-              during the wait, this is pessimistic.  The later waves wait in
-              the buffers inside the limiting pool -- in the L1's, if L2's
-              is the limit -- which the predicted miss occupancy includes.
+              leaves L2's latency.
+
+              `lookahead` is the work the core does while the C loads are
+              outstanding.  An in-order core does none: the first use of a
+              missing C line stops issue.  An out-of-order one goes on until
+              retirement, held up by those loads, fills its reorder buffer or
+              load queue: it issues them while the k-loop's last steps still
+              execute, and runs on into the next call, whose work does not
+              depend on them.  Give it in cycles (--lookahead), or give the
+              core's sizes (--rob, --load-queue) and it is derived for each
+              configuration from the kernel's instruction mix -- see
+              window_cycles().  With beta = 0 nothing is exposed: the
+              epilogue reads no C, and its stores wait for their lines in the
+              store buffer.
+
+              For very small k_c, where the core can run the next call's
+              whole k-loop during the wait, this is pessimistic.  The later
+              waves wait in the buffers inside the limiting pool -- in the
+              L1's, if L2's is the limit -- which the predicted miss
+              occupancy includes.
 
 PHASES.  Packing and the micro-kernel do not overlap in single-threaded BLIS,
 and pack traffic is not spread over the whole run -- it all happens inside
@@ -121,7 +136,7 @@ field to bracket it: run at 1.0 and at ~0.5 and report the interval.
 
 Cache spec, innermost level first.  One --cache argument per level:
 
-    size : line : assoc : rd[/wr] : usable : mshr[/wbuf] : latency
+    size : line : assoc : rd[/wr] : usable : mshr[/wbuf] : latency [: v]
 
 Any field may be left empty to take its default (line 64, associativity
 unknown, usable 1.0, no buffers modelled, latency 0, bandwidth unknown):
@@ -129,14 +144,22 @@ unknown, usable 1.0, no buffers modelled, latency 0, bandwidth unknown):
     --cache "32K:64:8:128/64:1.0:16/8:5" "768K::12:64/32:1.0:32/16:18" \
             "INF:::8/4:::90"
     --cache "32K:::64;1M:::48;INF:::8"         one string, ';' between levels
+    --cache ... "INF:::60G/30G:::55ns"          memory in GB/s and ns (--ghz)
     --cache generic                            a named preset
 
-A single number in the rd[/wr] or mshr[/wbuf] field means one shared resource
--- one bus carrying both directions, or one buffer pool serving both -- and
-the two are then checked together rather than separately.  -1 means unknown:
-the level is reported but never blamed.  INF marks main memory: its capacity
-is never consulted for residency, it only terminates the chain and supplies a
-bandwidth and a latency.
+Bandwidth is in bytes per core cycle.  Latency is in core cycles, and it is
+what the level adds to a miss from the level inside it (see CONCURRENCY), not
+the load-to-use total.  A level outside the core's clock domain -- DRAM above
+all -- may give them as 60G (GB/s) and 55ns instead: fixed in time, they are
+converted at --ghz.  A single number in the rd[/wr] or mshr[/wbuf] field means
+one shared resource -- one bus carrying both directions, or one buffer pool
+serving both -- and the two are then checked together rather than separately.
+-1 means unknown: the level is reported but never blamed.  INF marks main
+memory: its capacity is never consulted for residency, it only terminates the
+chain and supplies a bandwidth and a latency.  A trailing v marks a level
+whose evictions all go to the next one, clean lines too -- the next is a
+victim cache of it, or exclusive of it -- so its write-backs are every line it
+was filled with.
 
 Line size is per level and defaults to 64 B.  Most parts are uniform, but not
 all: some use 256 B throughout, and some widen only the outermost cache.  Fill
@@ -154,6 +177,7 @@ Usage:
     python3 model.py --cache "32K:64:8:128/64:1.0:16/8:4" \
                      "1M::8:48/24:1.0:16/8:20" "INF:::8/4:::150"
     python3 model.py --sw-prefetch ir:C:L2:keep k:A:L1:strm:4
+    python3 model.py --rob 320 --load-queue 88   # out-of-order core's window
     python3 model.py --pack scalar         # naive strided packing
     python3 model.py --cache generic --sweep kc
     python3 model.py --counters            # predicted PMU counts
@@ -192,9 +216,13 @@ class cache_level:
     :param wbuf: Max. outstanding write requests
     :param shared_buf: whether reads and writes share buffers (like shared_bw
                        for bandwidth)
-    :param lat: Load-to-use latency of the cache in cycles, as seen from lower
-                levels
-
+    :param lat: Latency this level adds to a miss from the level inside it,
+                in cycles: an increment over that level's, not the
+                load-to-use total (CONCURRENCY in the module docstring)
+    :param victim: whether its evictions all go to the next level, clean
+                   lines too -- the next is a victim cache of it, or
+                   exclusive of it -- so its write-backs are every line it
+                   was filled with
     """
     name: str
     size: float
@@ -254,13 +282,15 @@ class ukernel:
                   operations per cycle.
     :param bcast: Operands the k-loop loads element by element, as
                   broadcasts: one load per element rather than one per
-                  vector.  AOCL's 8x24 dgemm kernel broadcasts A.  Only the
-                  L1D_CACHE uop counts depend on it.
+                  vector.  AOCL's 8x24 dgemm kernel broadcasts A.  The
+                  L1D_CACHE uop counts and the instruction mix of an
+                  out-of-order window (kstep_mix) depend on it.
     :param call_ld: Loads per call outside the k-loop and the C tile:
                     arguments the kernel reads from memory, restored
-                    registers, the caller's bookkeeping.  Only the L1D_CACHE
-                    uop counts depend on it -- their time is already in the
-                    calibrated per-call cost.
+                    registers, the caller's bookkeeping.  Their time is
+                    already in the calibrated per-call cost: only the
+                    L1D_CACHE uop counts and an out-of-order window's share
+                    for the epilogue (epilogue_mix) depend on them.
     :param call_st: Stores per call likewise
     :param call_extra: Cycles per call spent by the caller between calls --
                        goto_bench's prefetch hook, say.  They overlap with
@@ -321,6 +351,24 @@ class hw_prefetcher:
     streams: int = 0
     min_run: int = 4
     level: str = ''
+
+
+@dataclass
+class ooo_window:
+    """
+    An out-of-order core's window over the epilogue's C fetch, to derive
+    `lookahead` from instead of giving it in cycles: the core keeps working
+    while the C loads are outstanding until in-order retirement, held up by
+    them, fills its reorder buffer or its load queue.  See window_cycles().
+
+    :param rob: reorder-buffer entries; 0: an in-order core, no window
+    :param load_queue: load-queue entries; 0: not a limit
+    :param vec_bytes: bytes one vector instruction covers, to count the
+                      k-loop's and the epilogue's instructions
+    """
+    rob: int = 0
+    load_queue: int = 0
+    vec_bytes: int = 64
 
 
 @dataclass
@@ -709,6 +757,16 @@ class analysis:
     :param pf_cover: combined prefetch coverage, by operand and then by the
                      name of the level filled into -- hardware and software
                      together
+    :param lookahead: cycles of work the core does while the epilogue's C
+                      loads are outstanding: given, or derived from `window`
+                      for this configuration
+    :param pf_pass: the part of pf_cover that also passes the buffers of the
+                    levels inside the target without holding them
+    :param pf_hold_inner: whether software prefetches into an outer level are
+                          tracked in the inner levels' buffers until they land
+    :param window: the out-of-order window `lookahead` was derived from, if
+                   any -- kept so that a rerun at another blocking derives
+                   its own
     """
     kernel: ukernel
     blocks: blocking
@@ -734,6 +792,7 @@ class analysis:
     lookahead: float = 0.0
     pf_pass: dict[str, dict[str, float]] = field(default_factory=dict)
     pf_hold_inner: bool = False
+    window: ooo_window | None = None
 
     @property
     def nest(self) -> loop_nest:
@@ -1545,7 +1604,7 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
             pk : packing=None, write_allocate : bool=True, core_mshr : int=0,
             pf : hw_prefetcher=None, c_layout : str='rm',
             sw : list[sw_prefetch]=None, lookahead : float=0.0,
-            pf_hold_inner : bool=False) -> analysis:
+            pf_hold_inner : bool=False, window : ooo_window=None) -> analysis:
     """
     Traffic crossing every boundary, bottom up.  Boundary i sits between
     level i and level i-1 (the core for i=0).  What crosses it is worked out
@@ -1568,6 +1627,12 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
                      - cm: C is column-major
     :param sw: software prefetches; their 'strm' hints change residency here,
                and their latency effect is applied once the traffic is known
+    :param lookahead: cycles of work the core does while the epilogue's C
+                      loads are outstanding (EXPOSURE in the module docstring)
+    :param pf_hold_inner: software prefetches into an outer level hold the
+                          inner levels' fill buffers until they land
+    :param window: an out-of-order window to derive the lookahead from for
+                   this configuration, instead of giving it
     :return: the analysis of this configuration
     """
     pk = pk or packing()
@@ -1667,12 +1732,18 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
     for bd, nxt in zip(bounds, bounds[1:]):
         bd.miss_out = nxt.tot_rd / bd.tot_rd if bd.tot_rd else 0.0
 
+    if window is not None and window.rob:
+        if lookahead:
+            raise ValueError("give a lookahead or an out-of-order window, "
+                             "not both")
+        lookahead = window_cycles(u, t.k_mean, window)['cycles']
     an = analysis(kernel=u, blocks=b, sizes=p, pk=pk, pf=pf,
                   write_allocate=write_allocate, core=core, rungs=rungs,
                   boundaries=bounds, c_layout=c_layout, streams=shape,
                   cov=coverage(shape, pf), pack_elems=w, flops=flops,
                   calls=calls, t_ukr=t_ukr, t_pack=t_pack, sw=sw, strm=strm,
-                  lookahead=lookahead, pf_hold_inner=pf_hold_inner)
+                  lookahead=lookahead, pf_hold_inner=pf_hold_inner,
+                  window=window)
     # the latency effect needs the traffic, so it comes last
     an.evals = [evaluate_prefetch(an, sp) for sp in sw]
     _apply_prefetch(an)
@@ -1754,6 +1825,86 @@ def _buffer_cycles(an : analysis, phase : str='ukr'):
     return out
 
 
+def kstep_mix(u : ukernel, vec_bytes : int) -> tuple[float, float]:
+    """
+    The k-loop's instructions per k-step, from the kernel's shape: one FMA
+    per vector of the m_r x n_r tile, and the loads of A and B -- one per
+    vector, or one per element for an operand in `bcast`.  Loop control and
+    address arithmetic are left out: an unrolled k-loop has little.  A
+    broadcast folded into the FMA as a memory operand (AVX-512's {1to8}) is
+    still counted as a separate instruction, so this errs towards a smaller
+    window.
+
+    :param u: microkernel model
+    :param vec_bytes: bytes one vector instruction covers
+    :return: (instructions, loads) per k-step
+    """
+    fma = u.m_r * u.n_r * u.size('C') / vec_bytes
+    ld = sum(n if op in u.bcast else n * u.size(op) / vec_bytes
+             for op, n in (('A', u.m_r), ('B', u.n_r)))
+    return fma + ld, ld
+
+
+def epilogue_mix(u : ukernel, vec_bytes : int) -> tuple[float, float]:
+    """
+    The epilogue's instructions and loads per call: per vector of the C tile
+    a load (if beta != 0), the arithmetic -- two operations for the general
+    case, one otherwise -- and a store, plus the call's own loads and stores
+    (call_ld, call_st).
+
+    :param u: microkernel model
+    :param vec_bytes: bytes one vector instruction covers
+    :return: (instructions, loads)
+    """
+    cv = u.m_r * u.n_r * u.size('C') / vec_bytes
+    ops = math.ceil(u.epi_flops / 2)
+    ld = (cv if u.c_read else 0.0) + u.call_ld
+    return cv * ((1 if u.c_read else 0) + ops + 1) + u.call_ld + u.call_st, ld
+
+
+def window_cycles(u : ukernel, k : float, w : ooo_window) -> dict:
+    """
+    Cycles an out-of-order core keeps working while the epilogue's C loads
+    are outstanding.  Retirement is in order, so the missing loads hold it
+    up; until the reorder buffer or the load queue is full, the core goes on
+    -- on both sides of them:
+
+      before  the C loads are issued as they enter the window, while the
+              k-steps ahead of them still execute: as many as fit in the
+              reorder buffer beside the epilogue, and whose loads fit in the
+              load queue beside the epilogue's
+      after   with the C loads at the head, the rest of the epilogue, the
+              return and the next call's k-loop fill the window behind them,
+              under the same two limits
+
+    Each side is counted in k-steps of kstep_mix(), at most one call's k, and
+    timed at the ideal k-step rate, 2*m_r*n_r/peak: a k-loop slower than that
+    covers more cycles with the same instructions, so this is a lower bound.
+    The `before` side assumes the k-loop keeps the reorder buffer full, as an
+    FMA-bound one does; a scheduler that fills first shortens it.
+
+    :param u: microkernel model
+    :param k: k-steps per call
+    :param w: the core's window
+    :return: {cycles, side (k-steps on each side), t_kstep, kstep (instructions,
+             loads per k-step), epilogue (instructions, loads)}
+    """
+    out = dict(cycles=0.0, side=0.0, t_kstep=0.0, kstep=(0.0, 0.0),
+               epilogue=(0.0, 0.0))
+    if w is None or w.rob <= 0:
+        return out
+    ops_k, ld_k = kstep_mix(u, w.vec_bytes)
+    ops_e, ld_e = epilogue_mix(u, w.vec_bytes)
+    side = (w.rob - ops_e) / ops_k
+    if w.load_queue and ld_k:
+        side = min(side, (w.load_queue - ld_e) / ld_k)
+    side = max(0.0, min(side, k))
+    t_k = 2 * u.m_r * u.n_r / u.peak
+    out.update(cycles=2 * side * t_k, side=side, t_kstep=t_k,
+               kstep=(ops_k, ld_k), epilogue=(ops_e, ld_e))
+    return out
+
+
 def _c_burst(an : analysis) -> dict:
     """
     The C tile's fetch, per call, as c_exposure() sees it.
@@ -1766,6 +1917,11 @@ def _c_burst(an : analysis) -> dict:
     out = dict(exposed=0.0, lines=0.0, waves=0, lat=0.0, queued=0.0,
                pool=None, slot=0.0, size=0)
     bds = an.boundaries
+    # with beta = 0 the epilogue reads no C: what crosses is its stores'
+    # write-allocate fetches, which the core does not wait for -- the stores
+    # wait for their lines in the store buffer
+    if not an.kernel.c_read:
+        return out
     c1 = bds[1].rd.get('C', 0.0) if len(bds) > 1 else 0.0
     if c1 <= 0 or not an.calls:
         return out
@@ -1803,7 +1959,8 @@ def c_exposure(an : analysis) -> tuple:
     cycles earlier, as far as the core sees ahead -- and they go through the
     tightest buffer pool on their way in waves of that pool's size.  Only a
     prefetch hides this: a timely one into L1 removes it, one into L2 leaves
-    L2's latency.
+    L2's latency.  With beta = 0 nothing is exposed: the epilogue reads no C,
+    and its stores wait for their lines in the store buffer.
     :param an: analysis of the configuration
     :return: (exposed cycles per call, C lines per call from beyond L1,
               waves, mean latency per line after prefetching)
@@ -2004,7 +2161,7 @@ def parse_hierarchy(spec : str | list[str], ghz : float=None) -> list[cache_leve
         rbw, wbw, shared_bw = _pair(f[3])
         usable = float(f[4]) if f[4] else 1.0
         mshr, wbuf, shared_buf = _pair(f[5], cast=int, unknown_neg=False)
-        mshr, wbuf = int(mshr or 0), int(wbuf or 0)
+        mshr, wbuf = max(0, int(mshr or 0)), max(0, int(wbuf or 0))
         lat = float(f[6]) if f[6] else 0.0
         if size == float('inf'):
             name = 'MEM'
@@ -2247,10 +2404,14 @@ def _rerun(an : analysis, sw : list[sw_prefetch]=None,
     :param blocks: blocksizes to use instead; None keeps an's
     :return: the new analysis
     """
+    # a derived lookahead is derived again, for the new blocking
+    derived = an.window is not None and an.window.rob
     return analyse(an.kernel, blocks or an.blocks, an.sizes,
                    [bd.level for bd in an.boundaries], an.pk,
                    an.write_allocate, an.core.mshr, an.pf, an.c_layout,
-                   an.sw if sw is None else sw, an.lookahead, an.pf_hold_inner)
+                   an.sw if sw is None else sw,
+                   0.0 if derived else an.lookahead, an.pf_hold_inner,
+                   an.window if derived else None)
 
 
 def report_prefetch(an : analysis, pred : prediction):
@@ -2314,7 +2475,7 @@ def report(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
            pk : packing=None, wa : bool=True, core_mshr : int=0,
            pf : hw_prefetcher=None, c_layout : str='rm',
            sw : list[sw_prefetch]=None, lookahead : float=0.0,
-           pf_hold_inner : bool=False) -> analysis:
+           pf_hold_inner : bool=False, window : ooo_window=None) -> analysis:
     """
     Analyse one configuration and print the full breakdown: traffic per
     boundary, stream shapes, the two phases, buffer occupancy, software
@@ -2331,10 +2492,15 @@ def report(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
     :param c_layout: - rm: C is row-major
                      - cm: C is column-major
     :param sw: software prefetches
+    :param lookahead: cycles of work the core does while the epilogue's C
+                      loads are outstanding
+    :param pf_hold_inner: software prefetches into an outer level hold the
+                          inner levels' fill buffers until they land
+    :param window: an out-of-order window to derive the lookahead from
     :return: the analysis, so that --counters can reuse it
     """
     an = analyse(u, b, p, levels, pk, wa, core_mshr, pf, c_layout, sw, lookahead,
-                 pf_hold_inner)
+                 pf_hold_inner, window)
     pred = predict(an)
     pk, G = an.pk, 2 ** 30
     print(f"micro-kernel {u.m_r}x{u.n_r}  s={_fmt_sizes(u)}  peak={u.peak} FLOP/cy  "
@@ -2360,10 +2526,20 @@ def report(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
           f"({100*an.t_pack/an.t_ideal:.0f}% packing)  for "
           f"{an.flops/1e9:.1f} GFLOP")
     ex, n_c, waves, lat_c = c_exposure(an)
-    if ex > 0:
+    derived = an.window is not None and an.window.rob
+    if n_c > 0 and lat_c > 0:
+        hide = 'window' if derived else 'lookahead'
         print(f"C epilogue: {n_c:.1f} lines/call from beyond "
               f"{an.boundaries[0].level.name}, {waves} wave(s) x {lat_c:.0f} cy"
-              f" - lookahead {an.lookahead:.0f} = {ex:.0f} cy exposed per call")
+              f" - {hide} {an.lookahead:.0f} = {ex:.0f} cy exposed per call")
+    if derived:
+        w = window_cycles(u, an.nest.k_mean, an.window)
+        lq = f", load queue {an.window.load_queue}" if an.window.load_queue else ''
+        print(f"out-of-order window: ROB {an.window.rob}{lq}; "
+              f"{w['kstep'][0]:.0f} instructions ({w['kstep'][1]:.0f} loads) a "
+              f"k-step, {w['epilogue'][0]:.0f} ({w['epilogue'][1]:.0f}) in the "
+              f"epilogue -> {w['side']:.1f} k-steps each side x "
+              f"{w['t_kstep']:.1f} cy = {w['cycles']:.0f} cy")
     print(f"core <- L1 : {an.core_rd/an.t_ideal:5.1f} B/cy read, "
           f"{an.core_wr/an.t_ideal:5.1f} B/cy write\n")
 
@@ -2476,8 +2652,9 @@ def _core_cache(name : str) -> bool:
 
 def counters(an : analysis, vl : int=64) -> pmu_prediction:
     """
-    Predicted ARM PMU event counts, for checking the model against
-    `perf stat`.
+    Predicted PMU event counts, under Arm's event names, for checking the
+    model against `perf stat` -- probe_events.py maps the names to other
+    cores' events.
 
     Boundary convention: boundary i supplies level i-1, so what boundary i+1
     supplies is exactly level i's refill stream.  Refills and writebacks are
@@ -3189,6 +3366,47 @@ def selftest() -> int:
     chk("prefetched into L2: one wave of L2 latency", c_exposure(to_l2)[0], 18)
     to_l1 = analyse(u, b, p, lv, free, sw=[parse_prefetch('ir:C:L1')])
     chk("prefetched into L1: nothing exposed", c_exposure(to_l1)[0], 0)
+    # beta = 0: the stores' write-allocate fetches cross, but nothing waits
+    u0 = replace(u, epi_flops=1, c_read=False)
+    z0 = analyse(u0, b, p, lv, free)
+    chk("beta = 0: C still crosses beyond L1 (write-allocate)",
+        float(z0.boundaries[1].rd['C'] > 0), 1.0)
+    chk("... but nothing is exposed", c_exposure(z0)[0], 0)
+
+    print("\nan out-of-order window, derived from the core's sizes")
+    # AOCL's 8x24 dgemm kernel on a 64-byte vector, A broadcast, 16 FLOP/cy:
+    # a k-step is 24 FMAs + 8 broadcasts + 3 B loads, 24 cycles; the
+    # epilogue 24 C vectors x (load + 2 ops + store)
+    uw = ukernel(8, 24, 8, 16.0, 16.0, 3, bcast='A')
+    chk("k-step: 35 instructions", kstep_mix(uw, 64)[0], 35)
+    chk("... 11 of them loads", kstep_mix(uw, 64)[1], 11)
+    chk("epilogue: 96 instructions, 24 loads", sum(epilogue_mix(uw, 64)), 120)
+    w = window_cycles(uw, 256, ooo_window(320, 88, 64))
+    chk("ROB 320: (320-96)/35 = 6.4 k-steps a side; load queue 88: "
+        "(88-24)/11 = 5.82 binds", w['side'], 64 / 11)
+    chk("... both sides at 24 cy a k-step", w['cycles'], 2 * 64 / 11 * 24)
+    chk("ROB alone: 6.4 k-steps a side",
+        window_cycles(uw, 256, ooo_window(320, 0, 64))['side'], 6.4)
+    chk("never more than one call's k a side",
+        window_cycles(uw, 4, ooo_window(320, 88, 64))['cycles'], 2 * 4 * 24)
+    chk("an in-order core: no window",
+        window_cycles(uw, 256, ooo_window(0, 0, 64))['cycles'], 0)
+    win = ooo_window(320, 88, 64)
+    aw = analyse(u, b, p, lv, free, window=win)
+    chk("analyse takes the window as the lookahead",
+        aw.lookahead, window_cycles(u, aw.nest.k_mean, win)['cycles'])
+    part = analyse(u, b, p, lv, free, window=ooo_window(157, 0, 64))
+    chk("ROB 157 on the 8x8 kernel: (157-32)/10 = 12.5 k-steps a side, 200 cy",
+        part.lookahead, 200)
+    chk("... which hides 200 of the 336 exposed", c_exposure(part)[0], 136)
+    small = _rerun(aw, blocks=blocking(4, b.m_c, b.n_c))
+    chk("a rerun at k_c 4 derives its own window", small.lookahead,
+        window_cycles(u, 4, win)['cycles'])
+    try:
+        analyse(u, b, p, lv, free, lookahead=50, window=win)
+        chk("a lookahead and a window together are refused", 0.0, 1.0)
+    except ValueError:
+        chk("a lookahead and a window together are refused", 1.0, 1.0)
 
     print("\nthe caller's per-call work overlaps the epilogue's wait for C")
     ex0 = c_exposure(an)[0]                      # 336 cycles, from above
@@ -3272,25 +3490,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     :return: a parser for every option the model takes
     """
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description=__doc__.strip().splitlines()[0] + ' ' +
+        __doc__.strip().splitlines()[1] + '  See the module docstring for the model.')
     ap.add_argument('--cache', nargs='+', default=['generic'],
                     metavar='LEVEL',
                     help='one argument per level, innermost first: '
-                         'size:line:assoc:rd[/wr]:usable:mshr[/wbuf]:latency'
+                         'size:line:assoc:rd[/wr]:usable:mshr[/wbuf]:latency[:v]'
                          ' . Any field may be empty to take its default, e.g.'
                          ' --cache "32K:64:8:128/64:1.0:16/8:5" "768K:::64/32"'
-                         ' "INF:::8/4:::90" . A single number in the '
-                         'bandwidth '
-                         'or buffer field means one shared resource. '
-                         '-1 = unknown, INF = memory. Presets: '
-                         + ', '.join(sorted(PRESETS)))
+                         ' "INF:::8/4:::90" . Bandwidth in bytes/cycle, latency'
+                         ' in cycles added over the level inside; 60G (GB/s) and'
+                         ' 55ns need --ghz.  A single number in the bandwidth '
+                         'or buffer field means one shared resource; -1 = '
+                         'unknown; a trailing v = evictions all go to the next '
+                         'level, clean ones too (victim or exclusive); INF = '
+                         'memory. Presets: ' + ', '.join(sorted(PRESETS)))
     ap.add_argument('--level-names', default='', metavar='NAMES',
                     help='names for the --cache levels, comma-separated and '
                          'innermost first, e.g. L1,L2,HBM,DDR; an empty name '
                          'keeps its default (L1, L2, ... and MEM), e.g. '
                          ',,HBM,DDR.  Prefetch targets use these names')
-    ap.add_argument('--mr', type=int, default=8)
-    ap.add_argument('--nr', type=int, default=8)
+    ap.add_argument('--mr', type=int, default=8, help="the micro-kernel's m_r")
+    ap.add_argument('--nr', type=int, default=8, help="the micro-kernel's n_r")
     ap.add_argument('--s', nargs='+', default=['8'], metavar='SIZE',
                     help='element size in bytes: one for every operand, '
                          'or per operand, e.g. --s A:1 B:1 C:4 for int8 '
@@ -3298,12 +3520,17 @@ def build_parser() -> argparse.ArgumentParser:
                          'plus overrides, e.g. --s 2 C:4.  --peak and '
                          '--epi-peak are then in that precision\'s '
                          'operations per cycle')
-    ap.add_argument('--peak', type=float, default=16.0)
-    ap.add_argument('--epi-peak', type=float, default=16.0)
+    ap.add_argument('--peak', type=float, default=16.0,
+                    help="the k-loop's FLOP/cycle (validate.py calibrate measures it)")
+    ap.add_argument('--epi-peak', type=float, default=16.0,
+                    help="the epilogue's FLOP/cycle: its cost per call is "
+                         "epi_flops*m_r*n_r / this")
     ap.add_argument('--beta', choices=['general', 'one', 'zero'], default='general',
                     help='general: fmul+fma, C read; one: fma only, C read; '
                          'zero: fmul only, C not read')
-    ap.add_argument('--no-write-allocate', action='store_true')
+    ap.add_argument('--no-write-allocate', action='store_true',
+                    help='a store that misses does not fetch the line first '
+                         '(matters for beta=zero, where C is not read)')
     ap.add_argument('--pack', choices=['none', 'vector', 'scalar'],
                     default='vector', help='packing kernel quality preset')
     ap.add_argument('--pack-rate', type=float, default=None,
@@ -3312,13 +3539,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help='override B read amplification (bytes fetched per '
                          'byte used); line/s for a kernel walking the long '
                          'stride, 1 for one that transposes in registers')
-    ap.add_argument('--kc', type=int, default=256)
-    ap.add_argument('--mc', type=int, default=256)
-    ap.add_argument('--nc', type=int, default=1024)
+    ap.add_argument('--kc', type=int, default=256, help='cache block k_c')
+    ap.add_argument('--mc', type=int, default=256, help='cache block m_c')
+    ap.add_argument('--nc', type=int, default=1024, help='cache block n_c')
     ap.add_argument('--ghz', type=float,
                     help="the core clock, for --cache fields given in ns or GB/s")
     ap.add_argument('--size', type=int, nargs=3, default=[2048, 2048, 2048],
-                    metavar=('M', 'N', 'K'))
+                    metavar=('M', 'N', 'K'), help='the problem: C is M x N, A M x K')
     ap.add_argument('--mem-bw', type=float, default=None,
                     help='override the outermost level\'s read bandwidth, '
                          'in bytes/cycle; its write bandwidth too if shared')
@@ -3331,8 +3558,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "0 = not modelled.")
     ap.add_argument('--bcast', default='', metavar='OPERANDS',
                     help="operands the k-loop loads as broadcasts, one load per "
-                         "element: A for AOCL's 8x24 dgemm kernel.  Only the "
-                         "L1D_CACHE uop counts depend on it.")
+                         "element: A for AOCL's 8x24 dgemm kernel.  The "
+                         "L1D_CACHE uop counts and the --rob window's "
+                         "instruction mix depend on it.")
     ap.add_argument('--sw-pf-holds-inner', action='store_true',
                     help="a software prefetch into an outer level is tracked in "
                          "the inner levels' fill buffers until it lands, so it "
@@ -3347,12 +3575,26 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--call-uops', default='0', metavar='LD[/ST]',
                     help="memory uops per call outside the k-loop and the C "
                          "tile: arguments read from memory, saved registers, "
-                         "the caller's bookkeeping.  Only the L1D_CACHE uop "
-                         "counts depend on it.")
+                         "the caller's bookkeeping.  Their time is in the "
+                         "per-call cost already: only the L1D_CACHE uop counts "
+                         "and the --rob window's epilogue depend on it.")
     ap.add_argument('--lookahead', type=float, default=0.0, metavar='CYCLES',
-                    help="cycles before the epilogue the core can already issue "
-                         "its C loads.  An un-prefetched C tile is fetched in "
-                         "series with the k-loop, less this.  Default 0.")
+                    help="cycles of work the core does while the epilogue's C "
+                         "loads are outstanding: issuing them early, and running "
+                         "on into the next call.  An un-prefetched C tile is "
+                         "fetched in series with the k-loop, less this.  Default "
+                         "0: an in-order core.  Or derive it with --rob")
+    ap.add_argument('--rob', type=int, default=0, metavar='N',
+                    help="reorder-buffer entries of an out-of-order core: derive "
+                         "the lookahead for each configuration from its window "
+                         "-- k-steps of the kernel's instruction mix that fit "
+                         "before and after the C loads -- instead of --lookahead")
+    ap.add_argument('--load-queue', type=int, default=0, metavar='N',
+                    help="load-queue entries, a second limit on the --rob window "
+                         "(0: none)")
+    ap.add_argument('--vec-bytes', type=int, default=None, metavar='BYTES',
+                    help="bytes one vector instruction covers, to count the "
+                         "--rob window's instructions (default: --vl)")
     ap.add_argument('--pf-streams', type=int, default=0,
                     help='streams the hardware prefetcher can track; 0 = none')
     ap.add_argument('--pf-min-run', type=int, default=4,
@@ -3374,10 +3616,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--c-layout', choices=['rm', 'cm'], default='rm',
                     help='how the ukr sees C: rm = m_r row runs, cm = n_r col runs')
     ap.add_argument('--vl', type=int, default=64,
-                    help='vector length in bytes, for the L1D_CACHE uop count')
+                    help='bytes per access as L1D_CACHE counts them, for its '
+                         'predicted uop count: the vector length on most cores '
+                         '(64 AVX-512 or SME, 32 AVX2, 16 NEON)')
     ap.add_argument('--counters', action='store_true',
                     help='print predicted PMU counts for perf verification')
-    ap.add_argument('--sweep', choices=['kc'])
+    ap.add_argument('--sweep', choices=['kc'],
+                    help="sweep k_c, re-deriving m_c to hold A_c's footprint")
     ap.add_argument('--selftest', action='store_true',
                     help='internal consistency checks, no machine data')
     return ap
@@ -3464,16 +3709,19 @@ def main(argv : list[str]=None) -> int:
         sw = [parse_prefetch(t) for t in a.sw_prefetch]
     except ValueError as e:
         ap.error(f"--sw-prefetch: {e}")
+    if a.rob and a.lookahead:
+        ap.error("give --lookahead or --rob, not both")
+    win = ooo_window(a.rob, a.load_queue, a.vec_bytes or a.vl) if a.rob else None
 
     if a.sweep:
         if a.counters:
             ap.error("--counters describes one configuration; it cannot be "
                      "combined with --sweep")
-        sweep(analyse(u, b, p, lv, pk, wa, a.core_mshr, pf, a.c_layout, sw),
-              a.sweep)
+        sweep(analyse(u, b, p, lv, pk, wa, a.core_mshr, pf, a.c_layout, sw,
+                      a.lookahead, a.sw_pf_holds_inner, win), a.sweep)
     else:
         an = report(u, b, p, lv, pk, wa, a.core_mshr, pf, a.c_layout, sw,
-                    a.lookahead, a.sw_pf_holds_inner)
+                    a.lookahead, a.sw_pf_holds_inner, win)
         if a.counters:
             report_counters(an, a.vl)
     return 0

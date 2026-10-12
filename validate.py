@@ -8,18 +8,25 @@ goto_bench measures.
     validate.py run --bench build/goto_bench --calib calib.json \\
                     --cache 32K:64:8:128/64:1.0:16/8:5 1M:64:8:64/32:1.0:32/16:18 INF:::8:::150 \\
                     --size 2000 4000 --kc 128 256 --mc 96 --nc 4096 [--top jc ir ...] \\
-                    [--pack A:ic,B:pc] [--prefetch ir:C:L2 ...] [--events-map events.json] \\
-                    [-o results.csv]
+                    [--pack A:ic,B:pc] [--prefetch ir:C:L2 ...] \\
+                    [--kernel-prefetch ir:C:L1:keep:100@128 ...] [--rob 320 --load-queue 88] \\
+                    [--events-map events.json] [-o results.csv]
 
 detect-cache  prints a --cache spec from sysfs: sizes, lines and ways.  The
               bandwidths, latencies and buffer counts are not in sysfs, and
               have to come from microbenchmarks or vendor data.
 
 calibrate     the micro-kernel at k small enough to stay in L1, fitted as
-              t(k) = C + b*k: peak = 2*mr*nr/b and the per-call cost C, which
-              the model charges as its epilogue.  Then one A_c and one B_c
-              block packed in cache: --pack-rate.  Cycles come from the cycle
-              counter if it is available, otherwise from ns * --ghz.
+              t(k) = C + b*k: peak = 2*mr*nr/b (or --peak, fixing the slope)
+              and the per-call cost C, which the model charges as its
+              epilogue.  Then the pack kernels, with source and packed copy in
+              L1, in L2 and from memory: the model takes the L1 rate, the
+              kernel's own cost, and adds the traffic where the source lives;
+              the other two are recorded to compare.  Then the per-call costs
+              inside the nest: with --events-map the loads and stores per call
+              and per k-step, with --prefetch the cycles, loads and stores of
+              goto_bench's prefetch hook.  Cycles come from the cycle counter
+              if it is available, otherwise from ns * --ghz.
 
 run           every combination of the sweep values, each measured by
               goto_bench and replayed through the model with the same
@@ -31,11 +38,17 @@ run           every combination of the sweep values, each measured by
               * a region below jc repeats on the same data, which in steady
                 state lives in the smallest cache that holds it -- so that
                 level is treated as memory (--no-steady to turn this off).
+                A hardware prefetcher filling that level or one inside it
+                has nothing left to fetch, and is idle for the run.
 
               Compared on cycles per region run, and on FLOP/cycle with the
               same 2*m*n*k work on both sides.  With --events-map (from
               probe_events.py) the measured counters are set against the
-              model's predicted counts as well.
+              model's predicted counts as well (--sum adds up events the core
+              counts apart), and --per-kstep splits each into a per-call and
+              a per-k-step part.  Prefetches inside the micro-kernel are the
+              model's only (--kernel-prefetch); on an out-of-order core,
+              --rob derives how much of the C fetch it overlaps.
 
 The model assumes BLIS's packing placement (A at ic, B at pc) when packing is
 inside the region: its rule that a packed block is repacked in place depends
@@ -458,6 +471,10 @@ def parse_size(s):
 
 
 def cmd_run(a):
+    if a.rob and a.lookahead:
+        raise SystemExit("give --lookahead or --rob, not both")
+    # an out-of-order core's window over the C fetch, derived per configuration
+    window = model.ooo_window(a.rob, a.load_queue, a.vec_bytes or a.vl) if a.rob else None
     with open(a.calib) as f:
         calib = json.load(f)
     if calib.get('c_layout', 'rm') != a.c_layout:
@@ -581,7 +598,9 @@ def cmd_run(a):
             flags.append(f"hardware prefetcher idle: what it fills {hw.level} with stays in {mem}")
             hw = model.hw_prefetcher(a.pf_streams, a.pf_min_run, '')
         an = model.analyse(u, b, p, lv, pk, True, a.core_mshr, hw,
-                           a.c_layout, sw, a.lookahead, a.sw_pf_holds_inner)
+                           a.c_layout, sw, a.lookahead, a.sw_pf_holds_inner, window)
+        if window:
+            flags.append(f"out-of-order window {an.lookahead:.0f} cy")
         if hook and hook.get('ld') is not None:
             # the hook's own loads and stores; its prefetch instructions the
             # model already counts
@@ -671,8 +690,11 @@ def main(argv=None):
         s = sub.add_parser(name)
         s.add_argument('--bench', required=True, help='path to goto_bench')
         s.add_argument('--ghz', type=float, help='clock, if there is no cycle counter')
-        s.add_argument('--beta', default='general', choices=list(EPI_FLOPS))
-        s.add_argument('--min-time', type=float, default=0.3)
+        s.add_argument('--beta', default='general', choices=list(EPI_FLOPS),
+                       help="the kernel's beta: general (C read; fmul+fma), one, or "
+                            "zero (C not read), as model.py --beta")
+        s.add_argument('--min-time', type=float, default=0.3,
+                       help="seconds goto_bench repeats each measurement for")
         s.add_argument('--extra', nargs='*', default=[], help='more goto_bench options, e.g. --cpu 2')
         s.add_argument('--cpu', type=int,
                        help="pin goto_bench to this CPU (on a desktop, keep its SMT "
@@ -695,42 +717,53 @@ def main(argv=None):
     c.add_argument('--events-map', help='events.json from probe_events.py: measure '
                                         'loads and stores per call (--call-uops)')
     c.add_argument('--vl', type=int, default=64,
-                   help='vector length in bytes, as run (NEON 16, AVX2 or 256-bit RVV 32)')
+                   help="bytes per access as L1D_CACHE counts them, as run")
     c.add_argument('--peak', type=float,
                    help="the micro-kernel's peak, FLOP/cycle, if known: fixes the "
                         "slope, so only the per-call cost is fitted")
-    c.add_argument('--group', type=int, default=4)
+    c.add_argument('--group', type=int, default=4,
+                   help="events per counter group, as run")
     c.add_argument('--l1', type=int, help='L1 data cache bytes (default: from sysfs)')
     c.add_argument('--l2', type=int, help='L2 cache bytes (default: from sysfs)')
     r = sub.choices['run']
     r.add_argument('--calib', required=True)
     r.add_argument('--cache', nargs='+', required=True, metavar='LEVEL',
                    help="model.py's --cache spec for this machine")
-    r.add_argument('--level-names', default='')
+    r.add_argument('--level-names', default='', metavar='NAMES',
+                   help="names for the --cache levels, as model.py --level-names")
     r.add_argument('--size', nargs='+', required=True,
                    help='problems: N for a cube, MxNxK (or M,N,K) otherwise -- '
                         'three numbers are three cubes')
     r.add_argument('--kc', nargs='+', required=True, help='N, or Nmr / Nnr')
     r.add_argument('--mc', nargs='+', required=True, help='N, or a multiple of the tile: 4mr')
     r.add_argument('--nc', nargs='+', required=True, help='N, or a multiple of the tile: 200nr')
-    r.add_argument('--top', nargs='+', default=['jc'], choices=RUNGS[:6])
-    r.add_argument('--pack', default='A:ic,B:pc')
-    r.add_argument('--prefetch', nargs='*', default=[],
-                   help="prefetches goto_bench issues between calls (and the model gets)")
+    r.add_argument('--top', nargs='+', default=['jc'], choices=RUNGS[:6],
+                   help="the loop each measurement times: jc for the whole GEMM, or "
+                        "a loop below it, repeated on the same data")
+    r.add_argument('--pack', default='A:ic,B:pc', metavar='OP:LOOP,...',
+                   help="the loop goto_bench packs each operand in, or pre for before "
+                        "the region; above --top it is packed once, untimed.  The "
+                        "model assumes BLIS's A:ic,B:pc (see above)")
+    r.add_argument('--prefetch', nargs='*', default=[], metavar='PF',
+                   help="prefetches goto_bench issues between calls (and the model gets): "
+                        "loop:operand:Lx[:hint[:lead]], the lead in calls, N or Nkc, also "
+                        "in the hint's place -- ir:C:L2:2kc is ir:C:L2:keep:2")
     r.add_argument('--kernel-prefetch', nargs='*', default=[], metavar='PF',
-                   help="prefetches inside the micro-kernel, for the model only, in "
-                        "model.py's syntax (lead in k-steps, or k for the whole "
-                        "k-loop: issued at the call's start); end one in @KMIN if the "
-                        "kernel issues it only when k_c >= KMIN.  AOCL's 8x24 dgemm "
-                        "kernel: ir:C:L1:keep:100@128; BLIS's armv8a 8x6: "
-                        "ir:C:L1:keep:k")
+                   help="prefetches inside the micro-kernel, for the model only: "
+                        "model.py's --sw-prefetch syntax, whose lead in k-steps may also "
+                        "be k or Nkc -- N times k_c, so k is the whole k-loop, issued "
+                        "at the call's start -- and may stand in the hint's place.  End "
+                        "one in @KMIN if the kernel issues it only when k_c >= KMIN.  "
+                        "AOCL's 8x24 dgemm kernel: ir:C:L1:keep:100@128; BLIS's armv8a "
+                        "8x6: ir:C:L1:keep:k")
     r.add_argument('--pf-streams', type=int, default=0,
                    help="hardware prefetcher streams, as model.py (0: not modelled)")
     r.add_argument('--pf-min-run', type=int, default=4,
                    help="lines before the hardware prefetcher detects a stream")
     r.add_argument('--pf-level', default='',
                    help="level the hardware prefetcher fills, e.g. L1 or L2")
-    r.add_argument('--core-mshr', type=int, default=0)
+    r.add_argument('--core-mshr', type=int, default=0,
+                   help="core load-queue entries, as model.py --core-mshr")
     r.add_argument('--bcast', default='', metavar='OPERANDS',
                    help="operands the kernel's k-loop loads as broadcasts (A for "
                         "AOCL's 8x24 dgemm kernel), for the L1D_CACHE uop counts")
@@ -740,13 +773,25 @@ def main(argv=None):
     r.add_argument('--call-uops', default='0', metavar='LD[/ST]',
                    help="memory uops per call outside the k-loop and the C tile, "
                         "as model.py --call-uops (AOCL's 8x24 kernel in goto_bench "
-                        "on Zen 5: about 90/47)")
+                        "on Zen 5: about 90/47); default: what calibrate measured "
+                        "with --events-map, else none")
     r.add_argument('--lookahead', type=float, default=0.0, metavar='CYCLES',
-                   help="cycles before the epilogue the core can issue its C loads, "
-                        "as model.py --lookahead")
+                   help="cycles of work the core does while the epilogue's C loads "
+                        "are outstanding, as model.py --lookahead (default 0: an "
+                        "in-order core)")
+    r.add_argument('--rob', type=int, default=0, metavar='N',
+                   help="reorder-buffer entries: derive the lookahead for each "
+                        "configuration instead, as model.py --rob")
+    r.add_argument('--load-queue', type=int, default=0, metavar='N',
+                   help="load-queue entries, a second limit on the --rob window "
+                        "(0: none)")
+    r.add_argument('--vec-bytes', type=int, metavar='BYTES',
+                   help="bytes one vector instruction covers, for the --rob window's "
+                        "instruction count (default: --vl)")
     r.add_argument('--vl', type=int, default=64,
-                   help="vector length in bytes, for the model's L1D_CACHE uop counts: "
-                        "64 for SME or AVX-512, 32 for AVX2 or 256-bit RVV, 16 for NEON")
+                   help="bytes per access as L1D_CACHE counts them, for the model's "
+                        "uop counts: the vector length on most cores (64 AVX-512 or "
+                        "SME, 32 AVX2, 16 NEON); the SpacemiT X60's counts fit 16")
     r.add_argument('--events-map', help='events.json from probe_events.py')
     r.add_argument('--group', type=int, default=4,
                    help='events per counter group; each group, led by the cycle '

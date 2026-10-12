@@ -399,8 +399,17 @@ Below that it prefetches nothing, so its C fetch is exposed every call.
 
 The model charges that exposed fetch in series with the k-loop: the C tile's
 lines from beyond L1, in waves through the tightest buffer pool on their way,
-times the latency left after any prefetch, less `--lookahead` (how far ahead
-of the epilogue the core issues the C loads; default 0). Later waves wait in
+times the latency left after any prefetch, less the work the core does while
+the C loads are outstanding. An in-order core does none -- the first use of a
+missing C line stops issue -- which is the default. An out-of-order core
+issues the C loads while the k-loop's last steps still run, and runs on into
+the next call until retirement, held up by those loads, fills its reorder
+buffer or load queue: give that as `--lookahead CYCLES`, or give the core's
+sizes, `--rob N [--load-queue N]`, and the model derives it for each
+configuration from the kernel's instructions per k-step (`--vec-bytes`, default
+`--vl`, for the vector width they cover). With `--beta zero` nothing is
+exposed: the epilogue reads no C, and its stores wait for their lines in the
+store buffer. Later waves wait in
 the buffers inside that pool -- in L1's MABs, if L2's buffers are the limit --
 and the predicted `L1D_MISS_OCCUPANCY` includes that wait. With a memory-bound
 C, this term usually binds, and its two unknowns separate on the counters: the
