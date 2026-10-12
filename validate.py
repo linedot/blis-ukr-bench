@@ -570,6 +570,16 @@ def cmd_run(a):
         n_harness = len(sw)
         sw += kernel_prefetches(a.kernel_prefetch, kc)
         hw = model.hw_prefetcher(a.pf_streams, a.pf_min_run, a.pf_level.upper())
+        caches = [L.name for L in lev if L.size != float('inf')]
+        if hw.level and hw.level not in caches:
+            raise SystemExit(f"--pf-level {a.pf_level}: not a cache level of --cache "
+                             f"({', '.join(caches)})")
+        # a steady state that keeps everything at or inside the level the
+        # prefetcher fills leaves it nothing to fetch (that level is now the
+        # memory, or gone): idle for this run, as a diagnostic only
+        if mem and hw.level and hw.level not in [L.name for L in lv if L.size != float('inf')]:
+            flags.append(f"hardware prefetcher idle: what it fills {hw.level} with stays in {mem}")
+            hw = model.hw_prefetcher(a.pf_streams, a.pf_min_run, '')
         an = model.analyse(u, b, p, lv, pk, True, a.core_mshr, hw,
                            a.c_layout, sw, a.lookahead, a.sw_pf_holds_inner)
         if hook and hook.get('ld') is not None:

@@ -1577,8 +1577,9 @@ def analyse(u : ukernel, b : blocking, p : problem, levels : list[cache_level],
     caches = [L.name for L in levels if L.size != float('inf')]
     if pf.level and pf.level not in caches:
         raise ValueError(f"the hardware prefetcher cannot fill "
-                         f"{pf.level!r}: the cache levels are "
-                         f"{', '.join(caches)}")
+                         f"{pf.level!r}: " +
+                         (f"the cache levels are {', '.join(caches)}" if caches else
+                          "there are no cache levels here, only memory"))
     shape = stream_shape(u, b, p, levels[0].line, c_layout)
     # the core's load queue tracks loads only; stores go through the store
     # queue, so it is a read-only holder
